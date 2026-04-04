@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Show daily Claude Code token usage aggregated from local session files."""
+
+import json
+import os
+import glob
+from collections import defaultdict
+from datetime import datetime
+
+
+def main():
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    daily = defaultdict(
+        lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0, "messages": 0}
+    )
+
+    for jsonl_path in glob.glob(f"{projects_dir}/**/*.jsonl", recursive=True):
+        try:
+            with open(jsonl_path) as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    msg = data.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+
+                    ts = data.get("timestamp")
+                    if not ts:
+                        continue
+
+                    if isinstance(ts, (int, float)):
+                        if ts > 1e12:
+                            ts = ts / 1000
+                        day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                    elif isinstance(ts, str):
+                        day = ts[:10]
+                    else:
+                        continue
+
+                    daily[day]["input"] += usage.get("input_tokens", 0)
+                    daily[day]["output"] += usage.get("output_tokens", 0)
+                    daily[day]["cache_read"] += usage.get("cache_read_input_tokens", 0)
+                    daily[day]["cache_create"] += usage.get("cache_creation_input_tokens", 0)
+                    daily[day]["messages"] += 1
+        except Exception:
+            pass
+
+    if not daily:
+        # Fall back to file modification dates if no timestamps in entries
+        for jsonl_path in glob.glob(f"{projects_dir}/**/*.jsonl", recursive=True):
+            mtime = os.path.getmtime(jsonl_path)
+            day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+            try:
+                with open(jsonl_path) as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                        msg = data.get("message", {})
+                        if not isinstance(msg, dict):
+                            continue
+                        usage = msg.get("usage")
+                        if not usage:
+                            continue
+                        daily[day]["input"] += usage.get("input_tokens", 0)
+                        daily[day]["output"] += usage.get("output_tokens", 0)
+                        daily[day]["cache_read"] += usage.get("cache_read_input_tokens", 0)
+                        daily[day]["cache_create"] += usage.get("cache_creation_input_tokens", 0)
+                        daily[day]["messages"] += 1
+            except Exception:
+                pass
+
+    if not daily:
+        print("No Claude Code session data found.")
+        return
+
+    print(
+        f"\n{'Date':<12} {'Input':>10} {'Output':>10} "
+        f"{'Cache Read':>12} {'Cache Create':>13} {'Messages':>9}"
+    )
+    print("-" * 68)
+    for day in sorted(daily.keys()):
+        d = daily[day]
+        print(
+            f"{day:<12} {d['input']:>10,} {d['output']:>10,} "
+            f"{d['cache_read']:>12,} {d['cache_create']:>13,} {d['messages']:>9,}"
+        )
+
+    total_in = sum(d["input"] for d in daily.values())
+    total_out = sum(d["output"] for d in daily.values())
+    total_cr = sum(d["cache_read"] for d in daily.values())
+    total_cc = sum(d["cache_create"] for d in daily.values())
+    total_msgs = sum(d["messages"] for d in daily.values())
+    print("-" * 68)
+    print(
+        f"{'TOTAL':<12} {total_in:>10,} {total_out:>10,} "
+        f"{total_cr:>12,} {total_cc:>13,} {total_msgs:>9,}"
+    )
+
+
+if __name__ == "__main__":
+    main()

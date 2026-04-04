@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Reconstruct and display a Claude Code conversation from session JSONL files.
+
+Usage:
+  claude-session                  # List all sessions
+  claude-session <session-id>     # Show full conversation
+  claude-session <session-id> --no-thinking   # Hide thinking blocks
+  claude-session <session-id> --no-tools      # Hide tool calls/results
+  claude-session <session-id> --compact        # Hide thinking + truncate tool results
+"""
+
+import json
+import os
+import sys
+import glob
+import textwrap
+from collections import defaultdict
+from datetime import datetime
+
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+
+def parse_timestamp(ts):
+    """Parse a timestamp (numeric epoch or ISO string) to epoch seconds."""
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return ts / 1000 if ts > 1e12 else ts
+    if isinstance(ts, str):
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                dt = datetime.strptime(ts, fmt)
+                return dt.timestamp()
+            except ValueError:
+                continue
+        # Fallback: try just the date
+        try:
+            return datetime.strptime(ts[:10], "%Y-%m-%d").timestamp()
+        except ValueError:
+            pass
+    return None
+
+
+def format_time(ts):
+    """Format a raw timestamp value to a display string."""
+    epoch = parse_timestamp(ts)
+    if epoch is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, ValueError):
+        return ""
+
+
+# Terminal colors
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+USER_COLOR = "\033[1;34m"      # Bold blue
+ASSISTANT_COLOR = "\033[1;32m"  # Bold green
+THINKING_COLOR = "\033[2;35m"   # Dim magenta
+TOOL_COLOR = "\033[0;33m"       # Yellow
+TOOL_RESULT_COLOR = "\033[2;33m"  # Dim yellow
+ERROR_COLOR = "\033[0;31m"      # Red
+SEPARATOR_COLOR = "\033[2;37m"  # Dim gray
+
+
+def find_sessions():
+    """Find all session JSONL files with metadata."""
+    sessions = []
+    for path in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
+        if "/subagents/" in path:
+            continue
+        stat = os.stat(path)
+        session_id = os.path.basename(path).replace(".jsonl", "")
+        project = path.split("/projects/")[1].split("/")[0]
+        # Clean up project name
+        project_display = project.replace("-home-john-projects-", "").replace("-home-john-", "~/")
+
+        first_msg = ""
+        line_count = 0
+        first_ts = None
+        last_ts = None
+        total_input = 0
+        total_output = 0
+        total_cache_read = 0
+        total_cache_create = 0
+        with open(path) as f:
+            for line in f:
+                line_count += 1
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                ts = parse_timestamp(data.get("timestamp"))
+                if ts:
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                msg = data.get("message", {})
+                if isinstance(msg, dict):
+                    if msg.get("role") == "user":
+                        c = msg.get("content", "")
+                        if isinstance(c, str) and c and not first_msg:
+                            first_msg = c[:80]
+                    usage = msg.get("usage")
+                    if usage:
+                        total_input += usage.get("input_tokens", 0)
+                        total_output += usage.get("output_tokens", 0)
+                        total_cache_read += usage.get("cache_read_input_tokens", 0)
+                        total_cache_create += usage.get("cache_creation_input_tokens", 0)
+
+        sessions.append({
+            "path": path,
+            "session_id": session_id,
+            "project": project_display,
+            "lines": line_count,
+            "first_ts": first_ts or stat.st_mtime,
+            "last_ts": last_ts or stat.st_mtime,
+            "first_msg": first_msg,
+            "total_input": total_input,
+            "total_output": total_output,
+            "total_cache_read": total_cache_read,
+            "total_cache_create": total_cache_create,
+        })
+
+    sessions.sort(key=lambda s: s["first_ts"], reverse=True)
+    return sessions
+
+
+def list_sessions():
+    """Print a table of all sessions."""
+    sessions = find_sessions()
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    print(f"\n{BOLD}Claude Code Sessions{RESET}\n")
+    print(f"  {'#':<4} {'Created':<12} {'Updated':<12} {'Input':>10} {'Output':>10}  {'Project':<30} {'First message'}")
+    print(f"  {'-'*4} {'-'*10}   {'-'*10}  {'-'*9}  {'-'*9}  {'-'*30} {'-'*35}")
+    grand_input = 0
+    grand_output = 0
+    for i, s in enumerate(sessions, 1):
+        created = datetime.fromtimestamp(s["first_ts"]).strftime("%Y-%m-%d")
+        updated = datetime.fromtimestamp(s["last_ts"]).strftime("%Y-%m-%d")
+        proj = s["project"][:30]
+        msg = s["first_msg"][:40]
+        grand_input += s["total_input"]
+        grand_output += s["total_output"]
+        print(
+            f"  {i:<4} {created:<12} {updated:<12} {s['total_input']:>10,} {s['total_output']:>10,}"
+            f"  {proj:<30} {msg}"
+        )
+    print(f"  {'-'*4} {'-'*10}   {'-'*10}  {'-'*9}  {'-'*9}")
+    print(f"  {'':4} {'':12} {'TOTAL':<12} {grand_input:>10,} {grand_output:>10,}")
+
+    print(f"\n  Use: claude-session <number> or claude-session <uuid>")
+    print(f"  Session UUIDs:\n")
+    for i, s in enumerate(sessions, 1):
+        print(f"    {DIM}{i:>3}{RESET}  {s['session_id']}")
+    print()
+
+
+def find_session_path(identifier):
+    """Find session path by ID or list number.
+
+    Resolution order:
+      - '#N' always means list index N
+      - If the identifier is numeric AND within the valid session range,
+        treat it as a list index (since UUID prefixes that short are rare
+        and ambiguous anyway)
+      - Otherwise try UUID prefix match
+    """
+    sessions = find_sessions()
+
+    # Explicit list index with # prefix
+    force_index = identifier.startswith("#")
+    if force_index:
+        identifier = identifier[1:]
+
+    # Try as list index
+    try:
+        idx = int(identifier) - 1
+        if 0 <= idx < len(sessions):
+            if force_index:
+                return sessions[idx]["path"]
+            # Also check if it matches a UUID prefix — if so, warn and
+            # prefer the list index (user can use more UUID chars to disambiguate)
+            return sessions[idx]["path"]
+    except ValueError:
+        pass
+
+    if force_index:
+        return None
+
+    # Search by session ID (prefix match)
+    matches = [s for s in sessions if s["session_id"].startswith(identifier)]
+    if len(matches) == 1:
+        return matches[0]["path"]
+    elif len(matches) > 1:
+        print(f"Ambiguous UUID prefix '{identifier}' matches {len(matches)} sessions:")
+        for s in matches:
+            print(f"  {s['session_id']}")
+        print("Provide more characters to disambiguate.")
+        sys.exit(1)
+
+    return None
+
+
+def format_content_block(block, show_thinking, show_tools, compact):
+    """Format a single content block for display."""
+    if not isinstance(block, dict):
+        return str(block)
+
+    btype = block.get("type", "")
+
+    if btype == "thinking":
+        if not show_thinking:
+            return None
+        thinking = block.get("thinking", "")
+        if not thinking:
+            return None
+        if compact:
+            lines = thinking.strip().split("\n")
+            preview = lines[0][:120]
+            if len(lines) > 1 or len(lines[0]) > 120:
+                preview += f" {DIM}[...{len(thinking)} chars]{RESET}"
+            return f"{THINKING_COLOR}  [thinking] {preview}{RESET}"
+        wrapped = textwrap.indent(thinking.strip(), "  ")
+        return f"{THINKING_COLOR}  [thinking]\n{wrapped}{RESET}"
+
+    elif btype == "text":
+        text = block.get("text", "")
+        if not text:
+            return None
+        return textwrap.indent(text.strip(), "  ")
+
+    elif btype == "tool_use":
+        if not show_tools:
+            return None
+        name = block.get("name", "unknown")
+        inp = block.get("input", {})
+        # Format tool input concisely
+        parts = []
+        for k, v in inp.items():
+            sv = str(v)
+            if compact and len(sv) > 100:
+                sv = sv[:100] + "..."
+            parts.append(f"{k}={sv}")
+        args = ", ".join(parts)
+        if compact and len(args) > 200:
+            args = args[:200] + "..."
+        return f"{TOOL_COLOR}  [{name}] {args}{RESET}"
+
+    elif btype == "tool_result":
+        if not show_tools:
+            return None
+        content = block.get("content", "")
+        is_error = block.get("is_error", False)
+        color = ERROR_COLOR if is_error else TOOL_RESULT_COLOR
+        prefix = "ERROR" if is_error else "result"
+
+        if isinstance(content, list):
+            # Extract text from content blocks
+            text_parts = []
+            for sub in content:
+                if isinstance(sub, dict) and sub.get("type") == "text":
+                    text_parts.append(sub.get("text", ""))
+            content = "\n".join(text_parts)
+
+        if not content:
+            return f"{color}  [{prefix}] (empty){RESET}"
+
+        if compact:
+            lines = content.strip().split("\n")
+            if len(lines) > 3:
+                preview = "\n".join(lines[:3])
+                preview = textwrap.indent(preview, "    ")
+                return f"{color}  [{prefix}] ({len(lines)} lines)\n{preview}\n    ...{RESET}"
+            else:
+                preview = textwrap.indent(content.strip(), "    ")
+                return f"{color}  [{prefix}]\n{preview}{RESET}"
+        else:
+            formatted = textwrap.indent(content.strip(), "    ")
+            return f"{color}  [{prefix}]\n{formatted}{RESET}"
+
+    return None
+
+
+def render_session(path, show_thinking=True, show_tools=True, compact=False):
+    """Render a full session conversation."""
+    with open(path) as f:
+        entries = []
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    if not entries:
+        print("Empty session file.")
+        return
+
+    # Group assistant lines by requestId to merge streaming chunks
+    request_groups = defaultdict(list)
+    ordered_items = []  # (timestamp, type, data)
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        if etype == "file-history-snapshot":
+            continue
+
+        msg = entry.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role")
+        ts = parse_timestamp(entry.get("timestamp"))
+
+        if role == "assistant":
+            rid = entry.get("requestId", id(entry))
+            request_groups[rid].append(entry)
+            # Only add on first occurrence
+            if len(request_groups[rid]) == 1:
+                ordered_items.append((ts, "assistant_group", rid))
+        elif role == "user":
+            ordered_items.append((ts, "user", entry))
+
+    # Get session metadata
+    session_id = entries[0].get("sessionId", "") if entries else ""
+    for e in entries:
+        if isinstance(e, dict) and e.get("sessionId"):
+            session_id = e["sessionId"]
+            break
+
+    print(f"\n{BOLD}Session: {session_id}{RESET}")
+    print(f"{SEPARATOR_COLOR}{'=' * 80}{RESET}\n")
+
+    msg_num = 0
+    for ts, item_type, data in ordered_items:
+        time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+
+        if item_type == "user":
+            msg = data.get("message", {})
+            content = msg.get("content", "")
+
+            # Skip tool_result entries displayed inline
+            if isinstance(content, list):
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
+                if has_tool_result:
+                    for block in content:
+                        rendered = format_content_block(block, show_thinking, show_tools, compact)
+                        if rendered:
+                            print(rendered)
+                    continue
+
+            msg_num += 1
+            print(f"{USER_COLOR}USER{RESET} {DIM}[{time_str}]{RESET}")
+            if isinstance(content, str):
+                print(textwrap.indent(content.strip(), "  "))
+            elif isinstance(content, list):
+                for block in content:
+                    rendered = format_content_block(block, show_thinking, show_tools, compact)
+                    if rendered:
+                        print(rendered)
+            print()
+
+        elif item_type == "assistant_group":
+            rid = data
+            group = request_groups[rid]
+            if not group:
+                continue
+
+            first_ts = parse_timestamp(group[0].get("timestamp"))
+            time_str = datetime.fromtimestamp(first_ts).strftime("%Y-%m-%d %H:%M:%S") if first_ts else ""
+
+            model = ""
+            for entry in group:
+                m = entry.get("message", {}).get("model", "")
+                if m:
+                    model = m
+                    break
+
+            model_tag = f" ({model})" if model else ""
+            print(f"{ASSISTANT_COLOR}ASSISTANT{model_tag}{RESET} {DIM}[{time_str}]{RESET}")
+
+            for entry in group:
+                msg = entry.get("message", {})
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        rendered = format_content_block(block, show_thinking, show_tools, compact)
+                        if rendered:
+                            print(rendered)
+                elif isinstance(content, str) and content.strip():
+                    print(textwrap.indent(content.strip(), "  "))
+
+            # Show usage summary if present
+            if not compact:
+                last_entry = group[-1]
+                usage = last_entry.get("message", {}).get("usage", {})
+                if usage:
+                    inp = usage.get("input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
+                    cache_r = usage.get("cache_read_input_tokens", 0)
+                    cache_c = usage.get("cache_creation_input_tokens", 0)
+                    print(f"{DIM}  [tokens: in={inp:,} out={out:,} cache_read={cache_r:,} cache_create={cache_c:,}]{RESET}")
+
+            print()
+
+    print(f"{SEPARATOR_COLOR}{'=' * 80}{RESET}")
+    print(f"{DIM}End of session{RESET}\n")
+
+
+def main():
+    args = sys.argv[1:]
+
+    show_thinking = True
+    show_tools = True
+    compact = False
+
+    flags = [a for a in args if a.startswith("-")]
+    positional = [a for a in args if not a.startswith("-")]
+
+    if "--help" in flags or "-h" in flags:
+        print(f"""{BOLD}claude-session{RESET} — Reconstruct Claude Code conversations from local session files
+
+{BOLD}USAGE{RESET}
+  claude-session                          List all sessions
+  claude-session <session>                Show full conversation
+  claude-session <session> [options]      Show with filtering options
+
+{BOLD}SESSION IDENTIFIER{RESET}
+  N                   Session number from the list (e.g. 3)
+  <uuid>              Full or partial session UUID
+  <path>              Direct path to a .jsonl file (e.g. for subagents)
+
+  A bare number within the session list range is treated as a list index.
+  Larger numbers or strings with non-digit characters are treated as UUID
+  prefixes. If a prefix matches multiple sessions, you'll be prompted to
+  provide more characters.
+
+{BOLD}OPTIONS{RESET}
+  --no-thinking       Hide thinking/reasoning blocks
+  --no-tools          Hide tool calls and tool results
+  --compact           Hide thinking + truncate tool results to 3 lines
+  -h, --help          Show this help message
+
+{BOLD}EXAMPLES{RESET}
+  claude-session                          Show session list with dates and token usage
+  claude-session 1                        Replay the most recent session
+  claude-session 1 --compact              Same, but condensed output
+  claude-session 1 --no-tools             Just the conversation text and thinking
+  claude-session a8359a07                 Look up session by UUID prefix
+""")
+        return
+
+    for flag in flags:
+        if flag == "--no-thinking":
+            show_thinking = False
+        elif flag == "--no-tools":
+            show_tools = False
+        elif flag == "--compact":
+            show_thinking = False
+            compact = True
+
+    if not positional:
+        list_sessions()
+        return
+
+    identifier = positional[0]
+    path = find_session_path(identifier)
+    if not path:
+        print(f"Session not found: {identifier}")
+        print("Run claude-session with no arguments to list sessions.")
+        sys.exit(1)
+
+    # Check for subagents
+    session_dir = path.replace(".jsonl", "")
+    subagent_dir = os.path.join(session_dir, "subagents")
+    if os.path.isdir(subagent_dir):
+        subagents = glob.glob(f"{subagent_dir}/*.jsonl")
+        if subagents:
+            print(f"{DIM}Note: This session has {len(subagents)} subagent conversation(s).{RESET}")
+            print(f"{DIM}View them with: claude-session <path-to-subagent.jsonl>{RESET}\n")
+
+    render_session(path, show_thinking, show_tools, compact)
+
+
+if __name__ == "__main__":
+    main()

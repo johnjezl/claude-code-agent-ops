@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Show Claude Code tool and command usage aggregated from local session files."""
+
+import json
+import os
+import glob
+from collections import Counter, defaultdict
+
+
+def main():
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    history_path = os.path.expanduser("~/.claude/history.jsonl")
+
+    # Slash commands from history
+    slash_cmds = Counter()
+    if os.path.exists(history_path):
+        with open(history_path) as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                display = data.get("display", "")
+                if display.startswith("/"):
+                    cmd = display.strip().split()[0]
+                    slash_cmds[cmd] += 1
+
+    # Tool invocations from session files
+    tool_counts = Counter()
+    skill_counts = Counter()
+    for jsonl_path in glob.glob(f"{projects_dir}/**/*.jsonl", recursive=True):
+        try:
+            with open(jsonl_path) as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    msg = data.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("role") != "assistant":
+                        continue
+                    content = msg.get("content", "")
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            name = block.get("name", "unknown")
+                            tool_counts[name] += 1
+                            if name == "Skill":
+                                skill_name = block.get("input", {}).get("skill", "unknown")
+                                skill_counts[skill_name] += 1
+        except Exception:
+            pass
+
+    # Print slash commands
+    print("\nSlash commands (user-typed):")
+    print("-" * 35)
+    if slash_cmds:
+        for cmd, count in slash_cmds.most_common():
+            print(f"  {cmd:<20} {count:>6}")
+    else:
+        print("  (none found)")
+
+    # Print skill invocations
+    print("\nSkill invocations:")
+    print("-" * 35)
+    if skill_counts:
+        for skill, count in skill_counts.most_common():
+            print(f"  {skill:<20} {count:>6}")
+    else:
+        print("  (none found)")
+
+    # Print tool usage
+    print("\nTool usage (all sessions):")
+    print("-" * 35)
+    if tool_counts:
+        for tool, count in tool_counts.most_common():
+            print(f"  {tool:<35} {count:>6}")
+    else:
+        print("  (none found)")
+
+    print(f"\n  Total tool calls: {sum(tool_counts.values()):,}")
+
+
+if __name__ == "__main__":
+    main()
