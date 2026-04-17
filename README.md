@@ -99,14 +99,55 @@ A bare number within the session list range is treated as a list index. Larger n
 
 Sessions with subagent conversations are noted in the output.
 
+### claude-ncsl
+
+Report non-comment source lines (NCSL) broken down by language for any project directory.
+
+```
+$ claude-ncsl ~/projects/Embedded-Lab-Control
+
+NCSL report: Embedded-Lab-Control
+/home/john/projects/Embedded-Lab-Control
+
+  Language     Files      Total     Blank   Comment       NCSL   NCSL%
+  ---------------------------------------------------------------
+  Python          52     19,014     3,506       523     14,985   78.8%
+  HTML             7        796        73        14        709   89.1%
+  CSS              1        415        68        18        329   79.3%
+  Shell            4        375        60        78        237   63.2%
+  JavaScript       1         76        11        10         55   72.4%
+  ---------------------------------------------------------------
+  TOTAL           65     20,676     3,718       643     16,315   78.9%
+```
+
+Columns:
+- **Files** -- number of source files for that language
+- **Total** -- total lines in those files
+- **Blank** -- empty or whitespace-only lines
+- **Comment** -- lines that are only comments (lines with both code and comments count as NCSL)
+- **NCSL** -- non-comment source lines (Total - Blank - Comment)
+- **NCSL%** -- percentage of total lines that are NCSL
+
+**Supported languages:** Python, C, C++, C/C++ headers, JavaScript, TypeScript, Rust, Go, Java, CSS/SCSS/LESS, PHP, Shell, Ruby, Makefile, Lua, HTML, Assembly, Linker scripts.
+
+**Options:**
+
+| Flag | Effect |
+|------|--------|
+| `-x DIR` | Exclude a directory name (repeatable) |
+| `--no-color` | Disable colored output |
+| `-h`, `--help` | Show help |
+
+Defaults to the current directory if no path is given. Automatically skips `.git`, `node_modules`, `__pycache__`, `venv`, `build`, `dist`, and other common non-source directories.
+
 ## Installation
 
 The scripts are standalone Python 3 files with no dependencies beyond the standard library.
 
 ```bash
 # Copy to a directory in your PATH
-cp claude-usage claude-tools claude-session ~/Scripts/
-chmod +x ~/Scripts/claude-usage ~/Scripts/claude-tools ~/Scripts/claude-session
+cp claude-usage claude-tools claude-session claude-ncsl ~/Scripts/
+chmod +x ~/Scripts/claude-usage ~/Scripts/claude-tools ~/Scripts/claude-session ~/Scripts/claude-ncsl
 
 # Or add this repo's directory to your PATH
 echo 'export PATH="$HOME/projects/claude-code-agent-ops:$PATH"' >> ~/.bashrc

@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Report non-comment source lines (NCSL) and lines of code (LOC) for a project,
+broken down by language.
+
+Usage:
+    claude-ncsl [path] [options]
+
+    path            Project directory to scan (default: current directory)
+    -x DIR          Exclude directory name (repeatable, e.g. -x build -x dist)
+    --no-color      Disable colored output
+    -h, --help      Show this help
+
+Examples:
+    claude-ncsl
+    claude-ncsl ~/projects/my-app
+    claude-ncsl . -x vendor -x generated
+"""
+
+import os
+import sys
+
+
+# ── Language definitions ────────────────────────────────────────────
+
+# Each language maps to: (extensions, comment style)
+# Comment styles:
+#   "hash"       - # line comments
+#   "c"          - // line, /* */ block
+#   "html"       - <!-- --> block
+#   "lua"        - -- line, --[[ ]] block
+#   "asm"        - ; line comments (also @ for ARM)
+#   "none"       - no comments to strip
+
+LANGUAGES = {
+    "Python":     ((".py",), "hash"),
+    "C":          ((".c",), "c"),
+    "C Header":   ((".h",), "c"),
+    "C++":        ((".cpp", ".cc", ".cxx"), "c"),
+    "C++ Header": ((".hpp", ".hxx"), "c"),
+    "JavaScript": ((".js", ".jsx"), "c"),
+    "TypeScript":  ((".ts", ".tsx"), "c"),
+    "Rust":       ((".rs",), "c"),
+    "Go":         ((".go",), "c"),
+    "Java":       ((".java",), "c"),
+    "CSS":        ((".css", ".scss", ".less"), "c"),
+    "PHP":        ((".php",), "c"),
+    "Shell":      ((".sh", ".bash"), "hash"),
+    "Ruby":       ((".rb",), "hash"),
+    "Makefile":   ((".mk",), "hash"),
+    "Lua":        ((".lua",), "lua"),
+    "HTML":       ((".html", ".htm"), "html"),
+    "Assembly":   ((".s", ".S", ".asm"), "asm"),
+    "Linker":     ((".ld",), "c"),
+}
+
+# Build extension -> (language, comment_style) lookup
+EXT_MAP = {}
+for lang, (exts, style) in LANGUAGES.items():
+    for ext in exts:
+        EXT_MAP[ext] = (lang, style)
+
+# Directories to always skip
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist",
+    "target", ".next", ".nuxt", "egg-info", ".eggs",
+}
+
+# ── ANSI colors ─────────────────────────────────────────────────────
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+
+# ── Line counting ──────────────────────────────────────────────────
+
+def count_lines_hash(lines):
+    """Count for # comment languages (Python, Shell, Ruby, Makefile)."""
+    blank = 0
+    comment = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank += 1
+        elif stripped.startswith("#"):
+            comment += 1
+    return blank, comment
+
+
+def count_lines_c(lines):
+    """Count for C-style comment languages (// and /* */)."""
+    blank = 0
+    comment = 0
+    in_block = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank += 1
+            continue
+        if in_block:
+            comment += 1
+            if "*/" in stripped:
+                in_block = False
+                # If there's code after the closing */, it's a code line
+                after = stripped[stripped.index("*/") + 2:].strip()
+                if after:
+                    comment -= 1  # reclassify as code
+            continue
+        if stripped.startswith("//"):
+            comment += 1
+        elif stripped.startswith("/*"):
+            comment += 1
+            if "*/" not in stripped:
+                in_block = True
+            elif stripped.endswith("*/"):
+                pass  # single-line block comment, already counted
+            else:
+                # Code after closing */ on same line
+                after = stripped[stripped.index("*/") + 2:].strip()
+                if after:
+                    comment -= 1
+        elif "/*" in stripped:
+            # Code before /*, this line is code; but start tracking block
+            idx = stripped.index("/*")
+            rest = stripped[idx + 2:]
+            if "*/" not in rest:
+                in_block = True
+    return blank, comment
+
+
+def count_lines_html(lines):
+    """Count for HTML <!-- --> comments."""
+    blank = 0
+    comment = 0
+    in_block = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank += 1
+            continue
+        if in_block:
+            comment += 1
+            if "-->" in stripped:
+                in_block = False
+                after = stripped[stripped.index("-->") + 3:].strip()
+                if after:
+                    comment -= 1
+            continue
+        if stripped.startswith("<!--"):
+            comment += 1
+            if "-->" not in stripped:
+                in_block = True
+            elif stripped.endswith("-->"):
+                pass
+            else:
+                after = stripped[stripped.index("-->") + 3:].strip()
+                if after:
+                    comment -= 1
+        elif "<!--" in stripped:
+            idx = stripped.index("<!--")
+            rest = stripped[idx + 4:]
+            if "-->" not in rest:
+                in_block = True
+    return blank, comment
+
+
+def count_lines_lua(lines):
+    """Count for Lua: -- line comments, --[[ ]] block comments."""
+    blank = 0
+    comment = 0
+    in_block = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank += 1
+            continue
+        if in_block:
+            comment += 1
+            if "]]" in stripped:
+                in_block = False
+                after = stripped[stripped.index("]]") + 2:].strip()
+                if after:
+                    comment -= 1
+            continue
+        if stripped.startswith("--[[") or stripped.startswith("--[=["):
+            comment += 1
+            if "]]" not in stripped and "]=]" not in stripped:
+                in_block = True
+        elif stripped.startswith("--"):
+            comment += 1
+    return blank, comment
+
+
+def count_lines_asm(lines):
+    """Count for assembly: ; and @ comment characters."""
+    blank = 0
+    comment = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank += 1
+        elif stripped.startswith(";") or stripped.startswith("@"):
+            comment += 1
+        elif stripped.startswith("#"):
+            comment += 1
+    return blank, comment
+
+
+def count_lines_none(lines):
+    """Count only blank lines, no comment detection."""
+    blank = sum(1 for line in lines if not line.strip())
+    return blank, 0
+
+
+COUNTERS = {
+    "hash": count_lines_hash,
+    "c":    count_lines_c,
+    "html": count_lines_html,
+    "lua":  count_lines_lua,
+    "asm":  count_lines_asm,
+    "none": count_lines_none,
+}
+
+
+def count_file(path, style):
+    """Return (total, blank, comment) for a single file."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        return 0, 0, 0
+    total = len(lines)
+    blank, comment = COUNTERS[style](lines)
+    return total, blank, comment
+
+
+# ── Makefile name detection ─────────────────────────────────────────
+
+def classify_file(path):
+    """Return (language, comment_style) or None if unrecognized."""
+    basename = os.path.basename(path)
+    if basename in ("Makefile", "makefile", "GNUmakefile"):
+        return "Makefile", "hash"
+    _, ext = os.path.splitext(basename)
+    ext = ext.lower()
+    return EXT_MAP.get(ext)
+
+
+# ── Directory walk ──────────────────────────────────────────────────
+
+def scan_tree(root, extra_skip):
+    """Walk root and yield (path, language, style) for each source file."""
+    skip = SKIP_DIRS | set(extra_skip)
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune skipped directories in-place
+        dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            info = classify_file(fpath)
+            if info:
+                yield fpath, info[0], info[1]
+
+
+# ── Main ────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    use_color = True
+    extra_skip = []
+    target = "."
+
+    # Parse arguments
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            return
+        elif a == "--no-color":
+            use_color = False
+        elif a == "-x" and i + 1 < len(args):
+            i += 1
+            extra_skip.append(args[i])
+        elif not a.startswith("-"):
+            positional.append(a)
+        else:
+            print(f"Unknown option: {a}", file=sys.stderr)
+            print("Use -h for help.", file=sys.stderr)
+            sys.exit(1)
+        i += 1
+
+    if positional:
+        target = positional[0]
+
+    target = os.path.abspath(target)
+    if not os.path.isdir(target):
+        print(f"Not a directory: {target}", file=sys.stderr)
+        sys.exit(1)
+
+    if not use_color:
+        bold = dim = cyan = green = yellow = reset = ""
+    else:
+        bold, dim, cyan, green, yellow, reset = BOLD, DIM, CYAN, GREEN, YELLOW, RESET
+
+    # Collect stats per language
+    stats = {}  # lang -> {files, total, blank, comment}
+    for fpath, lang, style in scan_tree(target, extra_skip):
+        total, blank, comment = count_file(fpath, style)
+        if lang not in stats:
+            stats[lang] = {"files": 0, "total": 0, "blank": 0, "comment": 0}
+        stats[lang]["files"] += 1
+        stats[lang]["total"] += total
+        stats[lang]["blank"] += blank
+        stats[lang]["comment"] += comment
+
+    if not stats:
+        print("No source files found.")
+        return
+
+    # Sort by NCSL descending
+    ranked = sorted(stats.items(), key=lambda x: x[1]["total"] - x[1]["blank"] - x[1]["comment"], reverse=True)
+
+    # Header
+    project_name = os.path.basename(target)
+    print(f"\n{bold}NCSL report: {cyan}{project_name}{reset}")
+    print(f"{dim}{target}{reset}\n")
+
+    w_lang = max(len(lang) for lang, _ in ranked)
+    w_lang = max(w_lang, 8)
+
+    header = (
+        f"  {bold}{'Language':<{w_lang}}  {'Files':>6}  {'Total':>9}  "
+        f"{'Blank':>8}  {'Comment':>8}  {'NCSL':>9}  {'NCSL%':>6}{reset}"
+    )
+    print(header)
+    print(f"  {'-' * (w_lang + 53)}")
+
+    grand = {"files": 0, "total": 0, "blank": 0, "comment": 0, "ncsl": 0}
+
+    for lang, s in ranked:
+        ncsl = s["total"] - s["blank"] - s["comment"]
+        pct = (ncsl / s["total"] * 100) if s["total"] else 0
+        print(
+            f"  {green}{lang:<{w_lang}}{reset}  {s['files']:>6,}  {s['total']:>9,}  "
+            f"{s['blank']:>8,}  {s['comment']:>8,}  {yellow}{ncsl:>9,}{reset}  {pct:>5.1f}%"
+        )
+        grand["files"] += s["files"]
+        grand["total"] += s["total"]
+        grand["blank"] += s["blank"]
+        grand["comment"] += s["comment"]
+        grand["ncsl"] += ncsl
+
+    print(f"  {'-' * (w_lang + 53)}")
+    gpct = (grand["ncsl"] / grand["total"] * 100) if grand["total"] else 0
+    print(
+        f"  {bold}{'TOTAL':<{w_lang}}  {grand['files']:>6,}  {grand['total']:>9,}  "
+        f"{grand['blank']:>8,}  {grand['comment']:>8,}  {yellow}{grand['ncsl']:>9,}{reset}  {gpct:>5.1f}%{reset}"
+    )
+    print()
+
+
+if __name__ == "__main__":
+    main()
