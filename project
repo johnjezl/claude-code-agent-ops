@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Resolve a project short name to its directory path.
+
+Usage:
+    project              Show interactive menu of known projects
+    project <short>      Resolve short name (prefix match if unique) to path
+    project -l, --list   List all projects with short/long names and paths
+    project -e, --edit   Open the cache file in $EDITOR
+    project --rescan     Forget all names and re-prompt for every project
+    project -h, --help   Show this help
+
+This script writes the resolved path to stdout. To actually cd into the
+directory, use the shell wrapper function (add to ~/.bashrc):
+
+    project() {
+        local target
+        target=$(command project "$@") || return $?
+        [ -n "$target" ] && cd "$target"
+    }
+
+At startup, the script scans ~/projects for top-level directories:
+    - entries whose folder no longer exists are removed from the cache
+    - new folders trigger a prompt for short and long names (with suggested
+      defaults; press Enter to accept)
+"""
+
+import json
+import os
+import re
+import sys
+
+
+PROJECTS_DIR = os.path.expanduser("~/projects")
+CACHE_PATH = os.path.expanduser("~/.config/project/projects.json")
+
+
+# ── Cache I/O ───────────────────────────────────────────────────────
+
+def load_cache():
+    if not os.path.exists(CACHE_PATH):
+        return {}
+    try:
+        with open(CACHE_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_cache(cache):
+    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+    with open(CACHE_PATH, "w") as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+
+
+# ── Project discovery ──────────────────────────────────────────────
+
+def scan_projects():
+    try:
+        return sorted(
+            name for name in os.listdir(PROJECTS_DIR)
+            if not name.startswith(".")
+            and os.path.isdir(os.path.join(PROJECTS_DIR, name))
+        )
+    except FileNotFoundError:
+        return []
+
+
+# ── Name suggestions ───────────────────────────────────────────────
+
+# Hand-picked defaults for folders I recognized. Anything not listed
+# here falls through to the generic heuristic below.
+DEFAULT_NAMES = {
+    "claude-code-agent-ops":                ("ccao",    "Claude Code Agent Ops"),
+    "convert-to-md":                        ("md",      "Convert to Markdown"),
+    "CS-385-Cloud-Computing":               ("cloud",   "CS 385: Cloud Computing"),
+    "CS-496-Capstone-SLM-Operating-System": ("slmos",   "SLM Operating System (Capstone)"),
+    "Device-Lab":                           ("devlab",  "Device Lab"),
+    "Embedded-Lab-Control":                 ("elab",    "Embedded Lab Control"),
+    "EMRStudio":                            ("emr",     "EMR Studio"),
+    "RAG-Exercise":                         ("rag",     "RAG Exercise"),
+    "sd-mux":                               ("sdmux",   "SD Mux"),
+    "slm-os-page-sim":                      ("pagesim", "SLM OS Page Simulator"),
+    "slm-os-scheduler-ai":                  ("sched",   "SLM OS Scheduler (AI)"),
+    "smarthub":                             ("hub",     "Smart Hub"),
+    "stl-to-scad":                          ("stl",     "STL to SCAD"),
+}
+
+
+def suggest_short(folder):
+    if folder in DEFAULT_NAMES:
+        return DEFAULT_NAMES[folder][0]
+    name = folder.lower()
+    name = re.sub(r"^cs-\d+-", "", name)
+    name = re.sub(r"[^a-z0-9-]", "", name)
+    return name or "proj"
+
+
+def suggest_long(folder):
+    if folder in DEFAULT_NAMES:
+        return DEFAULT_NAMES[folder][1]
+    parts = folder.replace("_", "-").split("-")
+    return " ".join(p if p.isupper() else p.capitalize() for p in parts)
+
+
+VALID_SHORT = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
+
+
+def ensure_unique(candidate, taken):
+    if candidate not in taken:
+        return candidate
+    i = 2
+    while f"{candidate}{i}" in taken:
+        i += 1
+    return f"{candidate}{i}"
+
+
+# ── TTY I/O (stdout is captured by the shell wrapper) ──────────────
+
+def eprint(*a, **kw):
+    print(*a, file=sys.stderr, **kw)
+
+
+def tty_pair():
+    """Return (readline_fn, write_fn) that use /dev/tty, or None if unavailable."""
+    try:
+        ti = open("/dev/tty", "r")
+        to = open("/dev/tty", "w")
+    except OSError:
+        return None
+
+    def read():
+        return ti.readline()
+
+    def write(s):
+        to.write(s)
+        to.flush()
+
+    return read, write
+
+
+# ── Reconciliation ─────────────────────────────────────────────────
+
+def reconcile(cache):
+    on_disk = set(scan_projects())
+
+    # Drop entries whose folder vanished
+    removed = []
+    for short in list(cache):
+        entry = cache[short]
+        folder = entry.get("folder") if isinstance(entry, dict) else None
+        if folder not in on_disk:
+            removed.append((short, folder))
+            del cache[short]
+    for short, folder in removed:
+        eprint(f"project: removed '{short}' ({folder}) — folder no longer present")
+
+    # Find new folders
+    known_folders = {
+        e["folder"] for e in cache.values() if isinstance(e, dict) and "folder" in e
+    }
+    new_folders = [f for f in scan_projects() if f not in known_folders]
+    if not new_folders:
+        return cache
+
+    tty = tty_pair()
+    if tty is None:
+        eprint(f"project: no TTY available; skipping {len(new_folders)} new project(s)")
+        return cache
+    read_line, write = tty
+
+    write(f"\nFound {len(new_folders)} new project folder(s) in {PROJECTS_DIR}.\n")
+    write("Press Enter to accept the suggested name, or type your own.\n")
+
+    taken = set(cache.keys())
+    for folder in new_folders:
+        write(f"\n  Folder: {folder}\n")
+        short_default = ensure_unique(suggest_short(folder), taken)
+        while True:
+            write(f"    Short name [{short_default}]: ")
+            answer = read_line().strip()
+            short = answer or short_default
+            if not VALID_SHORT.match(short):
+                write("    (must start with a letter; use letters/digits/_/-)\n")
+                continue
+            if short in taken:
+                write(f"    '{short}' is already used — pick another.\n")
+                continue
+            break
+        long_default = suggest_long(folder)
+        write(f"    Long name  [{long_default}]: ")
+        long_ = read_line().strip() or long_default
+        cache[short] = {"folder": folder, "long": long_}
+        taken.add(short)
+
+    return cache
+
+
+# ── Resolution ─────────────────────────────────────────────────────
+
+def resolve_short(cache, query):
+    """Exact > prefix > substring. Returns short or None; reports ambiguity."""
+    if query in cache:
+        return query
+    prefix = [s for s in cache if s.startswith(query)]
+    if len(prefix) == 1:
+        return prefix[0]
+    if len(prefix) > 1:
+        eprint(f"project: '{query}' is ambiguous — prefix matches: {', '.join(sorted(prefix))}")
+        return None
+    subs = [s for s in cache if query in s]
+    if len(subs) == 1:
+        return subs[0]
+    if len(subs) > 1:
+        eprint(f"project: '{query}' is ambiguous — substring matches: {', '.join(sorted(subs))}")
+        return None
+    eprint(f"project: no match for '{query}'")
+    eprint(f"project: known: {', '.join(sorted(cache))}")
+    return None
+
+
+def show_menu(cache):
+    tty = tty_pair()
+    if tty is None:
+        eprint("project: no TTY available for interactive menu")
+        return None
+    read_line, write = tty
+
+    items = sorted(cache.items(), key=lambda kv: kv[1].get("long", kv[0]).lower())
+    w_long = max(len(e.get("long", "")) for _, e in items)
+    write("\n")
+    for i, (short, entry) in enumerate(items, 1):
+        write(f"  {i:>3}. {entry.get('long', short):<{w_long}}  ({short})\n")
+    write("\n  Select (number, short name, or q to quit): ")
+    choice = read_line().strip()
+    if not choice or choice.lower() in ("q", "quit", "exit"):
+        return None
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(items):
+            return items[idx][0]
+        eprint(f"project: out-of-range selection: {choice}")
+        return None
+    return resolve_short(cache, choice)
+
+
+# ── Main ───────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    cache = load_cache()
+
+    if args and args[0] == "--rescan":
+        cache = {}
+        args = args[1:]
+
+    cache = reconcile(cache)
+    save_cache(cache)
+
+    if args and args[0] in ("-l", "--list"):
+        if not cache:
+            eprint("project: cache is empty")
+            return 0
+        w_short = max(len(s) for s in cache)
+        w_long = max(len(e.get("long", "")) for e in cache.values())
+        for short, entry in sorted(cache.items()):
+            print(
+                f"  {short:<{w_short}}  "
+                f"{entry.get('long', ''):<{w_long}}  "
+                f"-> {os.path.join(PROJECTS_DIR, entry['folder'])}"
+            )
+        return 0
+
+    if args and args[0] in ("-e", "--edit"):
+        editor = os.environ.get("EDITOR", "vi")
+        os.execvp(editor, [editor, CACHE_PATH])
+        return 0  # not reached
+
+    if not cache:
+        eprint(f"project: no projects found in {PROJECTS_DIR}")
+        return 1
+
+    if args:
+        short = resolve_short(cache, args[0])
+        if short is None:
+            return 1
+    else:
+        short = show_menu(cache)
+        if short is None:
+            return 1
+
+    path = os.path.join(PROJECTS_DIR, cache[short]["folder"])
+    if not os.path.isdir(path):
+        eprint(f"project: '{short}' -> {path} (no longer exists)")
+        return 1
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
