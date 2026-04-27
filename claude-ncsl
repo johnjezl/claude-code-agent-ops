@@ -6,7 +6,10 @@ Usage:
     claude-ncsl [path] [options]
 
     path            Project directory to scan (default: current directory)
-    -x DIR          Exclude directory name (repeatable, e.g. -x build -x dist)
+    -x DIR          Exclude a directory (repeatable). A bare name matches any
+                    directory by that name in the tree (e.g. -x vendor). A
+                    path with separators is treated as a path relative to the
+                    scan root and matches only that subtree (e.g. -x kernel/lib).
     --no-color      Disable colored output
     -h, --help      Show this help
 
@@ -14,6 +17,7 @@ Examples:
     claude-ncsl
     claude-ncsl ~/projects/my-app
     claude-ncsl . -x vendor -x generated
+    claude-ncsl . -x kernel/lib -x third_party/protobuf
 """
 
 import os
@@ -63,7 +67,7 @@ for lang, (exts, style) in LANGUAGES.items():
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
     ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist",
-    "target", ".next", ".nuxt", "egg-info", ".eggs",
+    "target", ".next", ".nuxt", "egg-info", ".eggs", "docs",
 }
 
 # ── ANSI colors ─────────────────────────────────────────────────────
@@ -253,11 +257,31 @@ def classify_file(path):
 # ── Directory walk ──────────────────────────────────────────────────
 
 def scan_tree(root, extra_skip):
-    """Walk root and yield (path, language, style) for each source file."""
-    skip = SKIP_DIRS | set(extra_skip)
+    """Walk root and yield (path, language, style) for each source file.
+
+    Excludes accept either a bare name (matches anywhere in the tree) or a
+    path with separators (matches only that directory relative to root).
+    """
+    name_skip = set(SKIP_DIRS)
+    path_skip = set()
+    for entry in extra_skip:
+        if "/" in entry or os.sep in entry:
+            path_skip.add(os.path.normpath(entry))
+        else:
+            name_skip.add(entry)
+
+    root_abs = os.path.abspath(root)
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune skipped directories in-place
-        dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+        kept = []
+        for d in dirnames:
+            if d.startswith(".") or d in name_skip:
+                continue
+            if path_skip:
+                rel = os.path.relpath(os.path.join(dirpath, d), root_abs)
+                if os.path.normpath(rel) in path_skip:
+                    continue
+            kept.append(d)
+        dirnames[:] = kept
         for fname in filenames:
             fpath = os.path.join(dirpath, fname)
             info = classify_file(fpath)

@@ -66,13 +66,23 @@ ERROR_COLOR = "\033[0;31m"      # Red
 SEPARATOR_COLOR = "\033[2;37m"  # Dim gray
 
 
-def find_sessions():
-    """Find all session JSONL files with metadata."""
+def find_sessions(max_age_days=None):
+    """Find all session JSONL files with metadata.
+
+    If max_age_days is set, skip files whose mtime is older than that.
+    """
     sessions = []
+    cutoff = None
+    if max_age_days is not None:
+        import time
+        cutoff = time.time() - max_age_days * 86400
+
     for path in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         if "/subagents/" in path:
             continue
         stat = os.stat(path)
+        if cutoff is not None and stat.st_mtime < cutoff:
+            continue
         session_id = os.path.basename(path).replace(".jsonl", "")
         project = path.split("/projects/")[1].split("/")[0]
         # Clean up project name
@@ -131,14 +141,21 @@ def find_sessions():
     return sessions
 
 
-def list_sessions():
-    """Print a table of all sessions."""
-    sessions = find_sessions()
+def list_sessions(max_age_days=None):
+    """Print a table of sessions, optionally filtered by mtime."""
+    sessions = find_sessions(max_age_days=max_age_days)
     if not sessions:
-        print("No sessions found.")
+        if max_age_days is not None:
+            print(f"No sessions updated in the last {max_age_days} day(s).")
+            print("Use --all or --days N to widen the window.")
+        else:
+            print("No sessions found.")
         return
 
-    print(f"\n{BOLD}Claude Code Sessions{RESET}\n")
+    header = "Claude Code Sessions"
+    if max_age_days is not None:
+        header += f" (last {max_age_days} day{'s' if max_age_days != 1 else ''})"
+    print(f"\n{BOLD}{header}{RESET}\n")
     print(f"  {'#':<4} {'Created':<12} {'Updated':<12} {'Input':>10} {'Output':>10}  {'Project':<30} {'First message'}")
     print(f"  {'-'*4} {'-'*10}   {'-'*10}  {'-'*9}  {'-'*9}  {'-'*30} {'-'*35}")
     grand_input = 0
@@ -164,17 +181,15 @@ def list_sessions():
     print()
 
 
-def find_session_path(identifier):
+def find_session_path(identifier, max_age_days=None):
     """Find session path by ID or list number.
 
     Resolution order:
-      - '#N' always means list index N
-      - If the identifier is numeric AND within the valid session range,
-        treat it as a list index (since UUID prefixes that short are rare
-        and ambiguous anyway)
-      - Otherwise try UUID prefix match
+      - '#N' always means list index N (into the filtered list)
+      - Numeric identifier: treat as list index into the filtered list
+      - Otherwise try UUID prefix match; filtered list first, then full list
     """
-    sessions = find_sessions()
+    sessions = find_sessions(max_age_days=max_age_days)
 
     # Explicit list index with # prefix
     force_index = identifier.startswith("#")
@@ -185,10 +200,6 @@ def find_session_path(identifier):
     try:
         idx = int(identifier) - 1
         if 0 <= idx < len(sessions):
-            if force_index:
-                return sessions[idx]["path"]
-            # Also check if it matches a UUID prefix — if so, warn and
-            # prefer the list index (user can use more UUID chars to disambiguate)
             return sessions[idx]["path"]
     except ValueError:
         pass
@@ -196,8 +207,11 @@ def find_session_path(identifier):
     if force_index:
         return None
 
-    # Search by session ID (prefix match)
+    # Search by session ID (prefix match) — filtered list first
     matches = [s for s in sessions if s["session_id"].startswith(identifier)]
+    if not matches and max_age_days is not None:
+        # Widen the search to all sessions for UUID prefix lookup
+        matches = [s for s in find_sessions() if s["session_id"].startswith(identifier)]
     if len(matches) == 1:
         return matches[0]["path"]
     elif len(matches) > 1:
@@ -426,15 +440,13 @@ def main():
     show_thinking = True
     show_tools = True
     compact = False
+    max_age_days = 3  # default window for listing
 
-    flags = [a for a in args if a.startswith("-")]
-    positional = [a for a in args if not a.startswith("-")]
-
-    if "--help" in flags or "-h" in flags:
+    if "--help" in args or "-h" in args:
         print(f"""{BOLD}claude-session{RESET} — Reconstruct Claude Code conversations from local session files
 
 {BOLD}USAGE{RESET}
-  claude-session                          List all sessions
+  claude-session                          List recent sessions (last 3 days)
   claude-session <session>                Show full conversation
   claude-session <session> [options]      Show with filtering options
 
@@ -449,13 +461,17 @@ def main():
   provide more characters.
 
 {BOLD}OPTIONS{RESET}
+  -d N, --days N      Show sessions updated in the last N days (default: 3)
+  --all               Show all sessions regardless of age
   --no-thinking       Hide thinking/reasoning blocks
   --no-tools          Hide tool calls and tool results
   --compact           Hide thinking + truncate tool results to 3 lines
   -h, --help          Show this help message
 
 {BOLD}EXAMPLES{RESET}
-  claude-session                          Show session list with dates and token usage
+  claude-session                          List sessions from the last 3 days
+  claude-session --days 14                List sessions from the last 14 days
+  claude-session --all                    List every session on disk
   claude-session 1                        Replay the most recent session
   claude-session 1 --compact              Same, but condensed output
   claude-session 1 --no-tools             Just the conversation text and thinking
@@ -463,21 +479,56 @@ def main():
 """)
         return
 
-    for flag in flags:
-        if flag == "--no-thinking":
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--no-thinking":
             show_thinking = False
-        elif flag == "--no-tools":
+        elif a == "--no-tools":
             show_tools = False
-        elif flag == "--compact":
+        elif a == "--compact":
             show_thinking = False
             compact = True
+        elif a == "--all":
+            max_age_days = None
+        elif a in ("-d", "--days"):
+            if i + 1 >= len(args):
+                print(f"Missing value for {a}", file=sys.stderr)
+                sys.exit(1)
+            i += 1
+            try:
+                n = int(args[i])
+            except ValueError:
+                print(f"--days expects an integer, got: {args[i]}", file=sys.stderr)
+                sys.exit(1)
+            if n < 0:
+                print("--days must be >= 0", file=sys.stderr)
+                sys.exit(1)
+            max_age_days = None if n == 0 else n
+        elif a.startswith("--days="):
+            try:
+                n = int(a.split("=", 1)[1])
+            except ValueError:
+                print(f"--days expects an integer, got: {a}", file=sys.stderr)
+                sys.exit(1)
+            if n < 0:
+                print("--days must be >= 0", file=sys.stderr)
+                sys.exit(1)
+            max_age_days = None if n == 0 else n
+        elif a.startswith("-"):
+            print(f"Unknown option: {a}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            positional.append(a)
+        i += 1
 
     if not positional:
-        list_sessions()
+        list_sessions(max_age_days=max_age_days)
         return
 
     identifier = positional[0]
-    path = find_session_path(identifier)
+    path = find_session_path(identifier, max_age_days=max_age_days)
     if not path:
         print(f"Session not found: {identifier}")
         print("Run claude-session with no arguments to list sessions.")
