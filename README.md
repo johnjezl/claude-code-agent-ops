@@ -64,24 +64,43 @@ Reports three categories:
 
 ### claude-session
 
-List sessions and replay full conversations with color-coded output.
+List sessions, summarize a single session, or replay full conversations with color-coded output.
 
 ```
-$ claude-session
+$ claude-session            # sessions updated in the last 3 days
+$ claude-session -v         # same, with token usage columns and totals
 ```
 
-Lists all sessions with created/updated dates, token usage, project name, and first message.
+Lists sessions with list number, session UUID, created/updated times, project, and title (the session's custom title, else its AI-generated title, else its first prompt). Worktree projects are shown as `repo:worktree`.
+
+```
+$ claude-session 3 --info
+```
+
+Shows a summary of session #3 without replaying it:
+
+- **Identity** -- title, project, working directory, git branch, worktree (name, base branch and commit), remote-control URL, transcript path
+- **Timeline** -- start, last activity, elapsed and active time, prompt/response counts, interruptions, compactions
+- **Environment** -- models used, effort level, permission mode, entrypoint, Claude Code version
+- **Activity** -- tool calls by tool, tool errors, skills invoked, subagents, web searches, pull requests, files modified
+- **Prompts** -- first and last prompt
+
+With `-v`, `--info` also shows token usage (including thinking tokens) and untruncated tool/file lists.
 
 ```
 $ claude-session 3
 ```
 
-Replays session #3 with full conversation: user messages, assistant text, thinking blocks, tool calls with arguments, tool results, and per-response token counts.
+Replays session #3 with full conversation: user messages, assistant text, thinking blocks, tool calls with arguments, and tool results. Add `-v` to show per-response token counts.
 
-**Display options:**
+**Options:**
 
 | Flag | Effect |
 |------|--------|
+| `-d N`, `--days N` | List sessions updated in the last N days (default 3; 0 = all) |
+| `--all` | List all sessions regardless of age |
+| `-v`, `--verbose` | Show token usage (list, replay, and `--info`) |
+| `-i`, `--info` | Summarize the session instead of replaying it |
 | `--compact` | Hide thinking blocks, truncate tool results to 3 lines |
 | `--no-thinking` | Hide thinking/reasoning blocks only |
 | `--no-tools` | Hide tool calls and tool results |

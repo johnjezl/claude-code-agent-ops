@@ -7,14 +7,19 @@ Usage:
   claude-session <session-id> --no-thinking   # Hide thinking blocks
   claude-session <session-id> --no-tools      # Hide tool calls/results
   claude-session <session-id> --compact        # Hide thinking + truncate tool results
+  claude-session <session-id> --info           # Session summary
+  claude-session -v                            # Include token usage
 """
 
 import json
 import os
 import sys
 import glob
+import shutil
+import signal
 import textwrap
-from collections import defaultdict
+import time
+from collections import Counter, defaultdict
 from datetime import datetime
 
 
@@ -66,82 +71,129 @@ ERROR_COLOR = "\033[0;31m"      # Red
 SEPARATOR_COLOR = "\033[2;37m"  # Dim gray
 
 
+def project_display_name(path):
+    """Derive a short project name from a session file path."""
+    project = path.split("/projects/")[1].split("/")[0]
+    home_prefix = os.path.expanduser("~").replace("/", "-")
+    for prefix, repl in ((home_prefix + "-projects-", ""), (home_prefix + "-", "~/")):
+        if project.startswith(prefix):
+            project = repl + project[len(prefix):]
+            break
+    # <repo>/.claude/worktrees/<name> -> <repo>:<name>
+    return project.replace("--claude-worktrees-", ":")
+
+
+def extract_user_text(content):
+    """Return the human-typed text of a user message, or '' if it isn't one.
+
+    Skips tool results, slash-command wrappers, and other injected content.
+    """
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result":
+                return ""
+            if b.get("type") == "text":
+                parts.append(b.get("text", ""))
+        text = "\n".join(parts)
+    else:
+        return ""
+    text = text.strip()
+    if not text or text.startswith("<") or text.startswith("[Request interrupted"):
+        return ""
+    return text
+
+
+def scan_session(path):
+    """Read a session file once and collect metadata and usage."""
+    stat = os.stat(path)
+    info = {
+        "path": path,
+        "session_id": os.path.basename(path)[:-len(".jsonl")],
+        "project": project_display_name(path),
+        "lines": 0,
+        "first_ts": None,
+        "last_ts": None,
+        "first_msg": "",
+        "custom_title": "",
+        "ai_title": "",
+        "total_input": 0,
+        "total_output": 0,
+        "total_cache_read": 0,
+        "total_cache_create": 0,
+    }
+    seen_ids = set()
+    with open(path) as f:
+        for line in f:
+            info["lines"] += 1
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            etype = data.get("type")
+            if etype == "custom-title" and data.get("customTitle"):
+                info["custom_title"] = data["customTitle"]
+            elif etype == "ai-title" and data.get("aiTitle"):
+                info["ai_title"] = data["aiTitle"]
+            ts = parse_timestamp(data.get("timestamp"))
+            if ts:
+                if not info["first_ts"]:
+                    info["first_ts"] = ts
+                info["last_ts"] = ts
+            msg = data.get("message")
+            # Only real transcript entries; api-request-blob etc. also carry
+            # a "message" but are request echoes, not conversation turns.
+            if etype not in ("user", "assistant") or not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "user" and not info["first_msg"] and not data.get("isMeta"):
+                info["first_msg"] = extract_user_text(msg.get("content", ""))[:200]
+            usage = msg.get("usage")
+            if usage and msg.get("role") == "assistant":
+                # One JSONL line is written per content block, each carrying
+                # the same message.id and usage; count each message once.
+                mid = msg.get("id")
+                if mid:
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                info["total_input"] += usage.get("input_tokens", 0) or 0
+                info["total_output"] += usage.get("output_tokens", 0) or 0
+                info["total_cache_read"] += usage.get("cache_read_input_tokens", 0) or 0
+                info["total_cache_create"] += usage.get("cache_creation_input_tokens", 0) or 0
+    info["first_ts"] = info["first_ts"] or stat.st_mtime
+    info["last_ts"] = info["last_ts"] or stat.st_mtime
+    info["title"] = info["custom_title"] or info["ai_title"] or info["first_msg"].split("\n")[0]
+    return info
+
+
 def find_sessions(max_age_days=None):
     """Find all session JSONL files with metadata.
 
     If max_age_days is set, skip files whose mtime is older than that.
     """
-    sessions = []
     cutoff = None
     if max_age_days is not None:
-        import time
         cutoff = time.time() - max_age_days * 86400
 
+    sessions = []
     for path in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
         if "/subagents/" in path:
             continue
-        stat = os.stat(path)
-        if cutoff is not None and stat.st_mtime < cutoff:
+        if cutoff is not None and os.stat(path).st_mtime < cutoff:
             continue
-        session_id = os.path.basename(path).replace(".jsonl", "")
-        project = path.split("/projects/")[1].split("/")[0]
-        # Clean up project name
-        project_display = project.replace("-home-john-projects-", "").replace("-home-john-", "~/")
-
-        first_msg = ""
-        line_count = 0
-        first_ts = None
-        last_ts = None
-        total_input = 0
-        total_output = 0
-        total_cache_read = 0
-        total_cache_create = 0
-        with open(path) as f:
-            for line in f:
-                line_count += 1
-                try:
-                    data = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                ts = parse_timestamp(data.get("timestamp"))
-                if ts:
-                    if not first_ts:
-                        first_ts = ts
-                    last_ts = ts
-                msg = data.get("message", {})
-                if isinstance(msg, dict):
-                    if msg.get("role") == "user":
-                        c = msg.get("content", "")
-                        if isinstance(c, str) and c and not first_msg:
-                            first_msg = c[:80]
-                    usage = msg.get("usage")
-                    if usage:
-                        total_input += usage.get("input_tokens", 0)
-                        total_output += usage.get("output_tokens", 0)
-                        total_cache_read += usage.get("cache_read_input_tokens", 0)
-                        total_cache_create += usage.get("cache_creation_input_tokens", 0)
-
-        sessions.append({
-            "path": path,
-            "session_id": session_id,
-            "project": project_display,
-            "lines": line_count,
-            "first_ts": first_ts or stat.st_mtime,
-            "last_ts": last_ts or stat.st_mtime,
-            "first_msg": first_msg,
-            "total_input": total_input,
-            "total_output": total_output,
-            "total_cache_read": total_cache_read,
-            "total_cache_create": total_cache_create,
-        })
+        sessions.append(scan_session(path))
 
     sessions.sort(key=lambda s: s["first_ts"], reverse=True)
     return sessions
 
 
-def list_sessions(max_age_days=None):
+def list_sessions(max_age_days=None, verbose=False):
     """Print a table of sessions, optionally filtered by mtime."""
     sessions = find_sessions(max_age_days=max_age_days)
     if not sessions:
@@ -156,28 +208,287 @@ def list_sessions(max_age_days=None):
     if max_age_days is not None:
         header += f" (last {max_age_days} day{'s' if max_age_days != 1 else ''})"
     print(f"\n{BOLD}{header}{RESET}\n")
-    print(f"  {'#':<4} {'Created':<12} {'Updated':<12} {'Input':>10} {'Output':>10}  {'Project':<30} {'First message'}")
-    print(f"  {'-'*4} {'-'*10}   {'-'*10}  {'-'*9}  {'-'*9}  {'-'*30} {'-'*35}")
-    grand_input = 0
-    grand_output = 0
-    for i, s in enumerate(sessions, 1):
-        created = datetime.fromtimestamp(s["first_ts"]).strftime("%Y-%m-%d")
-        updated = datetime.fromtimestamp(s["last_ts"]).strftime("%Y-%m-%d")
-        proj = s["project"][:30]
-        msg = s["first_msg"][:40]
-        grand_input += s["total_input"]
-        grand_output += s["total_output"]
-        print(
-            f"  {i:<4} {created:<12} {updated:<12} {s['total_input']:>10,} {s['total_output']:>10,}"
-            f"  {proj:<30} {msg}"
-        )
-    print(f"  {'-'*4} {'-'*10}   {'-'*10}  {'-'*9}  {'-'*9}")
-    print(f"  {'':4} {'':12} {'TOTAL':<12} {grand_input:>10,} {grand_output:>10,}")
 
-    print(f"\n  Use: claude-session <number> or claude-session <uuid>")
-    print(f"  Session UUIDs:\n")
+    width = shutil.get_terminal_size((160, 24)).columns
+    cols = f"  {'#':<4} {'Session ID':<36}  {'Created':<16}  {'Updated':<16}"
+    rule = f"  {'-'*4} {'-'*36}  {'-'*16}  {'-'*16}"
+    if verbose:
+        cols += f"  {'Input':>10} {'Output':>10} {'Cache Read':>13} {'Cache Write':>12}"
+        rule += f"  {'-'*10} {'-'*10} {'-'*13} {'-'*12}"
+    cols += f"  {'Project':<28}  "
+    rule += f"  {'-'*28}  "
+    title_width = max(20, width - len(cols))
+    print(f"{cols}Title")
+    print(f"{rule}{'-'*min(title_width, 40)}")
+
+    totals = [0, 0, 0, 0]
     for i, s in enumerate(sessions, 1):
-        print(f"    {DIM}{i:>3}{RESET}  {s['session_id']}")
+        created = datetime.fromtimestamp(s["first_ts"]).strftime("%Y-%m-%d %H:%M")
+        updated = datetime.fromtimestamp(s["last_ts"]).strftime("%Y-%m-%d %H:%M")
+        row = f"  {i:<4} {s['session_id']:<36}  {created:<16}  {updated:<16}"
+        if verbose:
+            vals = [s["total_input"], s["total_output"], s["total_cache_read"], s["total_cache_create"]]
+            totals = [a + b for a, b in zip(totals, vals)]
+            row += f"  {vals[0]:>10,} {vals[1]:>10,} {vals[2]:>13,} {vals[3]:>12,}"
+        proj = s["project"]
+        if len(proj) > 28:
+            proj = proj[:27] + "…"
+        title = s["title"].replace("\n", " ")
+        if len(title) > title_width:
+            title = title[:title_width - 1] + "…"
+        row += f"  {proj:<28}  {title}"
+        print(row)
+
+    if verbose:
+        print(f"  {'-'*4} {'-'*36}  {'-'*16}  {'-'*16}  {'-'*10} {'-'*10} {'-'*13} {'-'*12}")
+        print(f"  {'':4} {'':36}  {'':16}  {'TOTAL':<16}"
+              f"  {totals[0]:>10,} {totals[1]:>10,} {totals[2]:>13,} {totals[3]:>12,}")
+
+    print(f"\n  Replay: claude-session <# | uuid-prefix>    Details: claude-session <# | uuid-prefix> --info\n")
+
+
+def format_duration(seconds):
+    """Format seconds as e.g. '2h 05m', '7m 12s', '45s'."""
+    seconds = int(round(seconds or 0))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
+
+
+def collect_session_info(path):
+    """Gather detailed statistics about a single session."""
+    base = scan_session(path)
+    info = dict(base)
+    cwds = []
+    branches = []
+    versions = []
+    entrypoints = []
+    permission_modes = []
+    efforts = []
+    models = Counter()
+    tool_counts = Counter()
+    skills = Counter()
+    files_modified = []
+    pr_links = []
+    agent_calls = 0
+    tool_errors = 0
+    user_prompts = 0
+    interruptions = 0
+    assistant_msgs = 0
+    thinking_tokens = 0
+    web_searches = 0
+    web_fetches = 0
+    active_ms = 0
+    compactions = []
+    worktree = None
+    remote_url = ""
+    last_prompt = ""
+    seen_ids = set()
+
+    def add_unique(lst, val):
+        if val and val not in lst:
+            lst.append(val)
+
+    with open(path) as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            etype = data.get("type")
+            add_unique(cwds, data.get("cwd"))
+            add_unique(branches, data.get("gitBranch") if data.get("gitBranch") != "HEAD" else None)
+            add_unique(versions, data.get("version"))
+            add_unique(entrypoints, data.get("entrypoint"))
+            add_unique(efforts, data.get("effort"))
+
+            if etype == "permission-mode":
+                add_unique(permission_modes, data.get("permissionMode"))
+            elif etype == "worktree-state" and isinstance(data.get("worktreeSession"), dict):
+                worktree = data["worktreeSession"]
+            elif etype == "last-prompt" and data.get("lastPrompt"):
+                last_prompt = data["lastPrompt"]
+            elif etype == "pr-link" and data.get("prUrl"):
+                add_unique(pr_links, data["prUrl"])
+            elif etype == "system":
+                sub = data.get("subtype")
+                if sub == "turn_duration":
+                    active_ms += data.get("durationMs", 0) or 0
+                elif sub == "compact_boundary":
+                    meta = data.get("compactMetadata") or {}
+                    compactions.append((meta.get("trigger", "?"), meta.get("preTokens")))
+                elif sub == "bridge_status" and data.get("url"):
+                    remote_url = data["url"]
+
+            msg = data.get("message")
+            # Only real transcript entries; api-request-blob etc. also carry
+            # a "message" but are request echoes, not conversation turns.
+            if etype not in ("user", "assistant") or not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            role = msg.get("role")
+
+            if role == "user":
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                            tool_errors += 1
+                text = content if isinstance(content, str) else ""
+                if isinstance(content, list):
+                    text = " ".join(b.get("text", "") for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text")
+                if text.startswith("[Request interrupted"):
+                    interruptions += 1
+                elif not data.get("isMeta") and extract_user_text(content):
+                    user_prompts += 1
+
+            elif role == "assistant":
+                mid = msg.get("id")
+                new_msg = not mid or mid not in seen_ids
+                if mid:
+                    seen_ids.add(mid)
+                if new_msg:
+                    assistant_msgs += 1
+                    if msg.get("model") and msg["model"] != "<synthetic>":
+                        models[msg["model"]] += 1
+                    usage = msg.get("usage") or {}
+                    thinking_tokens += (usage.get("output_tokens_details") or {}).get("thinking_tokens", 0) or 0
+                    stu = usage.get("server_tool_use") or {}
+                    web_searches += stu.get("web_search_requests", 0) or 0
+                    web_fetches += stu.get("web_fetch_requests", 0) or 0
+                if isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict) or b.get("type") != "tool_use":
+                            continue
+                        name = b.get("name", "unknown")
+                        tool_counts[name] += 1
+                        inp = b.get("input") or {}
+                        if name == "Skill" and inp.get("skill"):
+                            skills[inp["skill"]] += 1
+                        elif name in ("Agent", "Task"):
+                            agent_calls += 1
+                        if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                            add_unique(files_modified, inp.get("file_path") or inp.get("notebook_path"))
+
+    subagent_dir = os.path.join(path[:-len(".jsonl")], "subagents")
+    subagent_files = sorted(glob.glob(f"{subagent_dir}/*.jsonl")) if os.path.isdir(subagent_dir) else []
+
+    info.update(
+        cwds=cwds, branches=branches, versions=versions, entrypoints=entrypoints,
+        permission_modes=permission_modes, efforts=efforts, models=models,
+        tool_counts=tool_counts, skills=skills, files_modified=files_modified,
+        pr_links=pr_links, agent_calls=agent_calls, tool_errors=tool_errors,
+        user_prompts=user_prompts, interruptions=interruptions,
+        assistant_msgs=assistant_msgs, thinking_tokens=thinking_tokens,
+        web_searches=web_searches, web_fetches=web_fetches, active_ms=active_ms,
+        compactions=compactions, worktree=worktree, remote_url=remote_url,
+        last_prompt=last_prompt, subagent_files=subagent_files,
+    )
+    return info
+
+
+def show_session_info(path, verbose=False):
+    """Print a summary of a single session."""
+    s = collect_session_info(path)
+    label_w = 16
+
+    def row(label, value):
+        if value in (None, "", [], 0):
+            return
+        print(f"  {DIM}{label:<{label_w}}{RESET} {value}")
+
+    def section(name):
+        print(f"\n{BOLD}{name}{RESET}")
+
+    print(f"\n{BOLD}Session {s['session_id']}{RESET}")
+    print(f"{SEPARATOR_COLOR}{'=' * 80}{RESET}")
+    row("Title", s["custom_title"] or s["ai_title"])
+    if s["custom_title"] and s["ai_title"] and s["custom_title"] != s["ai_title"]:
+        row("AI title", s["ai_title"])
+    row("Project", s["project"])
+    row("Directory", ", ".join(s["cwds"]))
+    row("Git branch", ", ".join(s["branches"]))
+    wt = s["worktree"]
+    if wt:
+        row("Worktree", f"{wt.get('worktreeName', '')} (from {wt.get('originalBranch', '?')} "
+                        f"@ {str(wt.get('originalHeadCommit', ''))[:10]})")
+    row("Remote control", s["remote_url"])
+    row("Session file", s["path"])
+
+    section("Timeline")
+    row("Started", format_time(s["first_ts"]))
+    row("Last activity", format_time(s["last_ts"]))
+    row("Elapsed", format_duration(s["last_ts"] - s["first_ts"]))
+    row("Active time", format_duration(s["active_ms"] / 1000) if s["active_ms"] else "")
+    row("User prompts", s["user_prompts"])
+    row("API responses", s["assistant_msgs"])
+    row("Interruptions", s["interruptions"])
+    if s["compactions"]:
+        parts = [f"{t}" + (f" @ {pt:,} tok" if pt else "") for t, pt in s["compactions"]]
+        row("Compactions", f"{len(parts)} ({', '.join(parts)})")
+
+    section("Environment")
+    row("Models", ", ".join(f"{m} ({n})" for m, n in s["models"].most_common()))
+    row("Effort", ", ".join(s["efforts"]))
+    row("Permission mode", ", ".join(s["permission_modes"]))
+    row("Entrypoint", ", ".join(s["entrypoints"]))
+    row("Claude Code", ", ".join(s["versions"]))
+
+    section("Activity")
+    total_tools = sum(s["tool_counts"].values())
+    if total_tools:
+        top = s["tool_counts"].most_common(None if verbose else 8)
+        summary = ", ".join(f"{n} {c}" for n, c in top)
+        if not verbose and len(s["tool_counts"]) > 8:
+            summary += ", …"
+        row("Tool calls", f"{total_tools:,}  ({summary})")
+    else:
+        row("Tool calls", "none")
+    row("Tool errors", s["tool_errors"])
+    row("Skills", ", ".join(f"{n} ({c})" for n, c in s["skills"].most_common()))
+    row("Subagents", (f"{len(s['subagent_files'])} transcript(s)" if s["subagent_files"]
+                      else f"{s['agent_calls']} call(s)") if (s["subagent_files"] or s["agent_calls"]) else "")
+    if s["web_searches"] or s["web_fetches"]:
+        row("Web", f"{s['web_searches']} search(es), {s['web_fetches']} fetch(es)")
+    for i, url in enumerate(s["pr_links"]):
+        row("Pull request" if i == 0 else "", url)
+    files = s["files_modified"]
+    if files:
+        row("Files modified", f"{len(files)}")
+        shown = files if verbose else files[:10]
+        root = s["cwds"][0].rstrip("/") + "/" if s["cwds"] else None
+        for fp in shown:
+            if root and fp.startswith(root):
+                fp = fp[len(root):]
+            print(f"  {'':<{label_w}}   {fp}")
+        if len(files) > len(shown):
+            print(f"  {'':<{label_w}}   {DIM}… {len(files) - len(shown)} more (use -v){RESET}")
+
+    if verbose:
+        section("Token usage")
+        row("Input", f"{s['total_input']:,}")
+        row("Output", f"{s['total_output']:,}")
+        row("  thinking", f"{s['thinking_tokens']:,}" if s["thinking_tokens"] else "")
+        row("Cache read", f"{s['total_cache_read']:,}")
+        row("Cache write", f"{s['total_cache_create']:,}")
+
+    section("Prompts")
+    first = s["first_msg"].replace("\n", " ")
+    row("First", first[:150] + ("…" if len(first) > 150 else ""))
+    last = s["last_prompt"].replace("\n", " ")
+    if last and last != s["first_msg"]:
+        row("Last", last[:150] + ("…" if len(last) > 150 else ""))
+
+    if s["subagent_files"]:
+        section("Subagent transcripts")
+        for fp in s["subagent_files"]:
+            print(f"  {fp}")
     print()
 
 
@@ -304,7 +615,7 @@ def format_content_block(block, show_thinking, show_tools, compact):
     return None
 
 
-def render_session(path, show_thinking=True, show_tools=True, compact=False):
+def render_session(path, show_thinking=True, show_tools=True, compact=False, verbose=False):
     """Render a full session conversation."""
     with open(path) as f:
         entries = []
@@ -326,7 +637,7 @@ def render_session(path, show_thinking=True, show_tools=True, compact=False):
         if not isinstance(entry, dict):
             continue
         etype = entry.get("type")
-        if etype == "file-history-snapshot":
+        if etype not in ("user", "assistant"):
             continue
 
         msg = entry.get("message", {})
@@ -417,8 +728,8 @@ def render_session(path, show_thinking=True, show_tools=True, compact=False):
                 elif isinstance(content, str) and content.strip():
                     print(textwrap.indent(content.strip(), "  "))
 
-            # Show usage summary if present
-            if not compact:
+            # Show usage summary when requested
+            if verbose:
                 last_entry = group[-1]
                 usage = last_entry.get("message", {}).get("usage", {})
                 if usage:
@@ -435,20 +746,24 @@ def render_session(path, show_thinking=True, show_tools=True, compact=False):
 
 
 def main():
+    # Exit quietly when piped into head/less and the reader closes early
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     args = sys.argv[1:]
 
     show_thinking = True
     show_tools = True
     compact = False
+    verbose = False
+    info_mode = False
     max_age_days = 3  # default window for listing
 
     if "--help" in args or "-h" in args:
         print(f"""{BOLD}claude-session{RESET} — Reconstruct Claude Code conversations from local session files
 
 {BOLD}USAGE{RESET}
-  claude-session                          List recent sessions (last 3 days)
-  claude-session <session>                Show full conversation
-  claude-session <session> [options]      Show with filtering options
+  claude-session [-v] [-d N | --all]      List recent sessions (last 3 days)
+  claude-session <session> [options]      Replay the full conversation
+  claude-session <session> -i [-v]        Show a summary of the session
 
 {BOLD}SESSION IDENTIFIER{RESET}
   N                   Session number from the list (e.g. 3)
@@ -463,6 +778,11 @@ def main():
 {BOLD}OPTIONS{RESET}
   -d N, --days N      Show sessions updated in the last N days (default: 3)
   --all               Show all sessions regardless of age
+  -v, --verbose       Show token usage (list columns, per-response counts in
+                      replay, token section in --info) and untruncated lists
+  -i, --info          Show session details instead of replaying it: title,
+                      directory, branch, worktree, timeline, models, tool and
+                      skill usage, files modified, PRs, subagents
   --no-thinking       Hide thinking/reasoning blocks
   --no-tools          Hide tool calls and tool results
   --compact           Hide thinking + truncate tool results to 3 lines
@@ -472,10 +792,13 @@ def main():
   claude-session                          List sessions from the last 3 days
   claude-session --days 14                List sessions from the last 14 days
   claude-session --all                    List every session on disk
+  claude-session -v                       List sessions with token usage
   claude-session 1                        Replay the most recent session
   claude-session 1 --compact              Same, but condensed output
   claude-session 1 --no-tools             Just the conversation text and thinking
   claude-session a8359a07                 Look up session by UUID prefix
+  claude-session 1 --info                 Summarize the most recent session
+  claude-session 1 -i -v                  Same, with token usage and full lists
 """)
         return
 
@@ -483,7 +806,11 @@ def main():
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--no-thinking":
+        if a in ("-v", "--verbose"):
+            verbose = True
+        elif a in ("-i", "--info"):
+            info_mode = True
+        elif a == "--no-thinking":
             show_thinking = False
         elif a == "--no-tools":
             show_tools = False
@@ -524,15 +851,25 @@ def main():
         i += 1
 
     if not positional:
-        list_sessions(max_age_days=max_age_days)
+        if info_mode:
+            print("--info requires a session identifier.", file=sys.stderr)
+            sys.exit(1)
+        list_sessions(max_age_days=max_age_days, verbose=verbose)
         return
 
     identifier = positional[0]
-    path = find_session_path(identifier, max_age_days=max_age_days)
+    if identifier.endswith(".jsonl") and os.path.isfile(identifier):
+        path = os.path.abspath(identifier)
+    else:
+        path = find_session_path(identifier, max_age_days=max_age_days)
     if not path:
         print(f"Session not found: {identifier}")
         print("Run claude-session with no arguments to list sessions.")
         sys.exit(1)
+
+    if info_mode:
+        show_session_info(path, verbose=verbose)
+        return
 
     # Check for subagents
     session_dir = path.replace(".jsonl", "")
@@ -543,7 +880,7 @@ def main():
             print(f"{DIM}Note: This session has {len(subagents)} subagent conversation(s).{RESET}")
             print(f"{DIM}View them with: claude-session <path-to-subagent.jsonl>{RESET}\n")
 
-    render_session(path, show_thinking, show_tools, compact)
+    render_session(path, show_thinking, show_tools, compact, verbose)
 
 
 if __name__ == "__main__":
