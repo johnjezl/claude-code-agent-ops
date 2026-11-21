@@ -40,7 +40,7 @@ def main():
     # per content block, and each line carries the same message.id and usage.
     seen_ids = set()
 
-    for jsonl_path in glob.glob(f"{projects_dir}/**/*.jsonl", recursive=True):
+    for jsonl_path in glob.glob(os.path.join(glob.escape(projects_dir), "**", "*.jsonl"), recursive=True):
         try:
             with open(jsonl_path) as f:
                 for line in f:
@@ -55,7 +55,7 @@ def main():
                     if not isinstance(msg, dict):
                         continue
                     usage = msg.get("usage")
-                    if not usage:
+                    if not isinstance(usage, dict) or not usage:
                         continue
 
                     mid = msg.get("id")

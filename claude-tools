@@ -10,57 +10,60 @@ from collections import Counter
 CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 
 
+def read_jsonl(path):
+    """Yield each JSON object in a JSONL file, skipping malformed lines.
+
+    A bad line never stops the rest of the file from being read; an
+    unreadable or missing file yields nothing.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(data, dict):
+                    yield data
+    except OSError:
+        return
+
+
 def main():
     projects_dir = os.path.join(CLAUDE_DIR, "projects")
     history_path = os.path.join(CLAUDE_DIR, "history.jsonl")
 
     # Slash commands from history
     slash_cmds = Counter()
-    if os.path.exists(history_path):
-        with open(history_path) as f:
-            for line in f:
-                try:
-                    data = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                display = data.get("display", "")
-                if display.startswith("/"):
-                    cmd = display.strip().split()[0]
-                    slash_cmds[cmd] += 1
+    for data in read_jsonl(history_path):
+        display = data.get("display")
+        if isinstance(display, str) and display.startswith("/"):
+            slash_cmds[display.strip().split()[0]] += 1
 
     # Tool invocations from session files
     tool_counts = Counter()
     skill_counts = Counter()
-    for jsonl_path in glob.glob(f"{projects_dir}/**/*.jsonl", recursive=True):
-        try:
-            with open(jsonl_path) as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    # Only real assistant turns; api-request-blob entries also
-                    # carry a "message" (a copy of the request) and would
-                    # double-count earlier tool calls.
-                    if not isinstance(data, dict) or data.get("type") != "assistant":
-                        continue
-                    msg = data.get("message", {})
-                    if not isinstance(msg, dict):
-                        continue
-                    if msg.get("role") != "assistant":
-                        continue
-                    content = msg.get("content", "")
-                    if not isinstance(content, list):
-                        continue
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            name = block.get("name", "unknown")
-                            tool_counts[name] += 1
-                            if name == "Skill":
-                                skill_name = block.get("input", {}).get("skill", "unknown")
-                                skill_counts[skill_name] += 1
-        except Exception:
-            pass
+    pattern = os.path.join(glob.escape(projects_dir), "**", "*.jsonl")
+    for jsonl_path in glob.glob(pattern, recursive=True):
+        for data in read_jsonl(jsonl_path):
+            # Only real assistant turns; api-request-blob entries also carry
+            # a "message" (a copy of the request) and would double-count
+            # earlier tool calls.
+            if data.get("type") != "assistant":
+                continue
+            msg = data.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name") or "unknown"
+                tool_counts[name] += 1
+                if name == "Skill":
+                    inp = block.get("input")
+                    skill = inp.get("skill") if isinstance(inp, dict) else None
+                    skill_counts[skill or "unknown"] += 1
 
     # Print slash commands
     print("\nSlash commands (user-typed):")

@@ -38,7 +38,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-PREFIX="${PREFIX%/}"
+# Make the prefix absolute and normalized (no trailing slash, no "..") so the
+# manifest records full paths and uninstall works from any directory.
+# -s keeps symlinked components as given; -m allows a not-yet-created path.
+PREFIX="$(realpath -m -s -- "$PREFIX")"
 BIN_DIR="$PREFIX/bin"
 SHARE_DIR="$PREFIX/share/$NAME"
 MANIFEST="$SHARE_DIR/installed-files"
@@ -46,7 +49,7 @@ MANIFEST="$SHARE_DIR/installed-files"
 # Report which file each tool name resolves to on the current PATH, and
 # flag any copies that shadow (come earlier than) the installed ones.
 check_path() {
-    local tool found first status=0
+    local tool found first other status=0
     for tool in "${TOOLS[@]}"; do
         mapfile -t found < <(type -aP "$tool" 2>/dev/null | awk '!seen[$0]++')
         if [ ${#found[@]} -eq 0 ]; then
@@ -57,7 +60,9 @@ check_path() {
         first="${found[0]}"
         printf '  %-16s %s\n' "$tool" "$first"
         if [ ${#found[@]} -gt 1 ]; then
-            printf '  %-16s   also found (shadowed): %s\n' "" "${found[@]:1}"
+            for other in "${found[@]:1}"; do
+                printf '  %-16s   shadowed: %s\n' "" "$other"
+            done
             status=1
         fi
     done
@@ -102,7 +107,12 @@ if [ ! -w "$BIN_DIR" ] || [ ! -w "$SHARE_DIR" ]; then
     die "cannot write to $PREFIX; re-run with sudo, or use --user for ~/.local"
 fi
 
-: > "$MANIFEST"
+# Files a previous install recorded; any that this version no longer ships
+# (e.g. a tool that was dropped) are removed below so they don't linger.
+previous=()
+[ -f "$MANIFEST" ] && mapfile -t previous < "$MANIFEST"
+
+installed=()
 for tool in "${TOOLS[@]}"; do
     src="$SRC_DIR/$tool"
     dest="$BIN_DIR/$tool"
@@ -115,8 +125,16 @@ for tool in "${TOOLS[@]}"; do
         install -m 0755 "$src" "$dest"
         echo "installed $dest"
     fi
-    echo "$dest" >> "$MANIFEST"
+    installed+=("$dest")
 done
+
+for old in "${previous[@]}"; do
+    case " ${installed[*]} " in *" $old "*) continue ;; esac
+    case "$old" in
+        "$BIN_DIR"/*) rm -f -- "$old" && echo "removed   $old (no longer part of $NAME)" ;;
+    esac
+done
+printf '%s\n' "${installed[@]}" > "$MANIFEST"
 
 echo
 echo "Installed ${#TOOLS[@]} tools into $BIN_DIR."
@@ -127,16 +145,23 @@ if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
     exit 0
 fi
 
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *) echo "Note: $BIN_DIR is not on your PATH; add it in ~/.profile or ~/.bashrc."
-       exit 0 ;;
-esac
+# Compare resolved paths so trailing slashes, "//" or symlinked directories
+# on PATH still count as the same directory.
+bin_real="$(realpath -m -- "$BIN_DIR")"
+on_path=0
+IFS=: read -r -a path_dirs <<< "$PATH"
+for d in "${path_dirs[@]}"; do
+    [ -n "$d" ] && [ "$(realpath -m -- "$d")" = "$bin_real" ] && { on_path=1; break; }
+done
+if [ "$on_path" = 0 ]; then
+    echo "Note: $BIN_DIR is not on your PATH; add it in ~/.profile or ~/.bashrc."
+    exit 0
+fi
 
 shadowed=0
 for tool in "${TOOLS[@]}"; do
     runs="$(type -P "$tool" || true)"
-    if [ "$runs" != "$BIN_DIR/$tool" ]; then
+    if [ -z "$runs" ] || [ "$(realpath -m -- "$runs")" != "$(realpath -m -- "$BIN_DIR/$tool")" ]; then
         [ "$shadowed" = 1 ] || { echo; echo "Warning: older copies come earlier on your PATH and will run instead:"; }
         printf '  %-16s %s\n' "$tool" "$runs"
         shadowed=1
