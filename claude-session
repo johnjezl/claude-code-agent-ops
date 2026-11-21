@@ -23,7 +23,9 @@ from collections import Counter, defaultdict
 from datetime import datetime
 
 
-PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+# Claude Code's data directory; honors CLAUDE_CONFIG_DIR like Claude Code does.
+CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
 
 
 def parse_timestamp(ts):
@@ -58,22 +60,34 @@ def format_time(ts):
         return ""
 
 
-# Terminal colors
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-USER_COLOR = "\033[1;34m"      # Bold blue
-ASSISTANT_COLOR = "\033[1;32m"  # Bold green
-THINKING_COLOR = "\033[2;35m"   # Dim magenta
-TOOL_COLOR = "\033[0;33m"       # Yellow
-TOOL_RESULT_COLOR = "\033[2;33m"  # Dim yellow
-ERROR_COLOR = "\033[0;31m"      # Red
-SEPARATOR_COLOR = "\033[2;37m"  # Dim gray
+# Terminal colors. Enabled only when stdout is a terminal and NO_COLOR is
+# unset (https://no-color.org); --color / --no-color override.
+COLORS = {
+    "RESET": "\033[0m",
+    "BOLD": "\033[1m",
+    "DIM": "\033[2m",
+    "USER_COLOR": "\033[1;34m",         # Bold blue
+    "ASSISTANT_COLOR": "\033[1;32m",    # Bold green
+    "THINKING_COLOR": "\033[2;35m",     # Dim magenta
+    "TOOL_COLOR": "\033[0;33m",         # Yellow
+    "TOOL_RESULT_COLOR": "\033[2;33m",  # Dim yellow
+    "ERROR_COLOR": "\033[0;31m",        # Red
+    "SEPARATOR_COLOR": "\033[2;37m",    # Dim gray
+}
+
+
+def set_color(enabled):
+    """Define the color globals as escape codes, or as empty strings."""
+    for name, code in COLORS.items():
+        globals()[name] = code if enabled else ""
+
+
+set_color(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
 
 
 def project_display_name(path):
     """Derive a short project name from a session file path."""
-    project = path.split("/projects/")[1].split("/")[0]
+    project = os.path.relpath(path, PROJECTS_DIR).split(os.sep)[0]
     home_prefix = os.path.expanduser("~").replace("/", "-")
     for prefix, repl in ((home_prefix + "-projects-", ""), (home_prefix + "-", "~/")):
         if project.startswith(prefix):
@@ -788,6 +802,10 @@ def main():
     # Exit quietly when piped into head/less and the reader closes early
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     args = sys.argv[1:]
+    if "--no-color" in args:
+        set_color(False)
+    elif "--color" in args:
+        set_color(True)
 
     show_thinking = True
     show_tools = True
@@ -827,7 +845,13 @@ def main():
   --no-thinking       Hide thinking/reasoning blocks
   --no-tools          Hide tool calls and tool results
   --compact           Hide thinking + truncate tool results to 3 lines
+  --color, --no-color Force colors on/off (default: on only for a terminal,
+                      off if NO_COLOR is set). Use --color with less -R.
   -h, --help          Show this help message
+
+{BOLD}ENVIRONMENT{RESET}
+  CLAUDE_CONFIG_DIR   Claude Code data directory (default: ~/.claude)
+  NO_COLOR            Disable colors when set
 
 {BOLD}EXAMPLES{RESET}
   claude-session                          List sessions from the last 3 days
@@ -847,7 +871,9 @@ def main():
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("-v", "--verbose"):
+        if a in ("--color", "--no-color"):
+            pass  # handled above
+        elif a in ("-v", "--verbose"):
             verbose = True
         elif a in ("-i", "--info"):
             info_mode = True

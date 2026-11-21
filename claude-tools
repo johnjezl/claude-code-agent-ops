@@ -4,12 +4,15 @@
 import json
 import os
 import glob
-from collections import Counter, defaultdict
+from collections import Counter
+
+# Claude Code's data directory; honors CLAUDE_CONFIG_DIR like Claude Code does.
+CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 
 
 def main():
-    projects_dir = os.path.expanduser("~/.claude/projects")
-    history_path = os.path.expanduser("~/.claude/history.jsonl")
+    projects_dir = os.path.join(CLAUDE_DIR, "projects")
+    history_path = os.path.join(CLAUDE_DIR, "history.jsonl")
 
     # Slash commands from history
     slash_cmds = Counter()
@@ -36,7 +39,10 @@ def main():
                         data = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
                         continue
-                    if not isinstance(data, dict):
+                    # Only real assistant turns; api-request-blob entries also
+                    # carry a "message" (a copy of the request) and would
+                    # double-count earlier tool calls.
+                    if not isinstance(data, dict) or data.get("type") != "assistant":
                         continue
                     msg = data.get("message", {})
                     if not isinstance(msg, dict):

@@ -104,6 +104,7 @@ Replays session #3 with full conversation: user messages, assistant text, thinki
 | `--compact` | Hide thinking blocks, truncate tool results to 3 lines |
 | `--no-thinking` | Hide thinking/reasoning blocks only |
 | `--no-tools` | Hide tool calls and tool results |
+| `--color`, `--no-color` | Force colors on or off (see [Color output](#color-output)) |
 | `-h`, `--help` | Show help |
 
 **Session identifiers:**
@@ -124,10 +125,10 @@ Sessions with subagent conversations are noted in the output.
 Report non-comment source lines (NCSL) broken down by language for any project directory.
 
 ```
-$ claude-ncsl ~/projects/Embedded-Lab-Control
+$ claude-ncsl ~/projects/my-app
 
-NCSL report: Embedded-Lab-Control
-/home/john/projects/Embedded-Lab-Control
+NCSL report: my-app
+/home/user/projects/my-app
 
   Language     Files      Total     Blank   Comment       NCSL   NCSL%
   ---------------------------------------------------------------
@@ -154,24 +155,46 @@ Columns:
 
 | Flag | Effect |
 |------|--------|
-| `-x DIR` | Exclude a directory name (repeatable) |
-| `--no-color` | Disable colored output |
+| `-x DIR` | Exclude a directory (repeatable). A bare name matches anywhere; a path like `kernel/lib` matches only that subtree |
+| `--color`, `--no-color` | Force colors on or off (see [Color output](#color-output)) |
 | `-h`, `--help` | Show help |
 
 Defaults to the current directory if no path is given. Automatically skips `.git`, `node_modules`, `__pycache__`, `venv`, `build`, `dist`, and other common non-source directories.
 
 ## Installation
 
-The scripts are standalone Python 3 files with no dependencies beyond the standard library.
+The tools are standalone Python 3 scripts with no dependencies beyond the standard library. `install.sh` installs them on Linux (tested on Ubuntu):
 
 ```bash
-# Copy to a directory in your PATH
-cp claude-usage claude-tools claude-session claude-ncsl ~/Scripts/
-chmod +x ~/Scripts/claude-usage ~/Scripts/claude-tools ~/Scripts/claude-session ~/Scripts/claude-ncsl
+git clone https://github.com/johnjezl/claude-code-agent-ops.git
+cd claude-code-agent-ops
 
-# Or add this repo's directory to your PATH
-echo 'export PATH="$HOME/projects/claude-code-agent-ops:$PATH"' >> ~/.bashrc
+sudo ./install.sh          # system-wide, into /usr/local/bin
+./install.sh --user        # or just for you, into ~/.local/bin (no sudo)
 ```
+
+| Option | Effect |
+|--------|--------|
+| `--user` | Install into `~/.local/bin` instead of `/usr/local/bin` |
+| `--prefix DIR` | Install into `DIR/bin` |
+| `--link` | Symlink to the checkout instead of copying, so edits take effect immediately (for development) |
+| `--uninstall` | Remove a previous install. Pass the same `--user`/`--prefix` you installed with |
+| `--check` | Show which copy of each tool your `PATH` runs, and flag older copies that shadow it |
+
+To update, `git pull` and re-run the same install command.
+
+If you previously copied the scripts into a personal bin directory (e.g. `~/bin` or `~/Scripts`) that comes earlier on your `PATH`, those old copies will keep running instead of the installed ones. Delete them, run `hash -r`, then check with `./install.sh --check`.
+
+## Configuration
+
+| Variable | Effect |
+|----------|--------|
+| `CLAUDE_CONFIG_DIR` | Where to find Claude Code's data, the same variable Claude Code uses. Default: `~/.claude` |
+| `NO_COLOR` | Disable colored output when set to any value ([no-color.org](https://no-color.org)) |
+
+### Color output
+
+`claude-session` and `claude-ncsl` use color only when writing to a terminal, so piping or redirecting their output (`| grep`, `> file`) gives plain text. Use `--no-color` to turn color off in a terminal, or `--color` to keep it through a pipe, e.g. `claude-session 1 --color | less -R`.
 
 ## How it works
 
@@ -185,7 +208,7 @@ The scripts glob all `.jsonl` files under `~/.claude/projects/` and parse the `u
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.8+
 - Claude Code (the session files it generates)
 
 ## License

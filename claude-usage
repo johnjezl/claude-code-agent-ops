@@ -7,6 +7,9 @@ import glob
 from collections import defaultdict
 from datetime import datetime, timezone
 
+# Claude Code's data directory; honors CLAUDE_CONFIG_DIR like Claude Code does.
+CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+
 
 def _to_local_day(ts):
     """Convert a timestamp (epoch or ISO string, possibly UTC) to local YYYY-MM-DD."""
@@ -29,7 +32,7 @@ def _to_local_day(ts):
 
 
 def main():
-    projects_dir = os.path.expanduser("~/.claude/projects")
+    projects_dir = os.path.join(CLAUDE_DIR, "projects")
     daily = defaultdict(
         lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0, "messages": 0}
     )
@@ -45,7 +48,8 @@ def main():
                         data = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
                         continue
-                    if not isinstance(data, dict):
+                    # Only real assistant turns (skip api-request-blob etc.)
+                    if not isinstance(data, dict) or data.get("type") != "assistant":
                         continue
                     msg = data.get("message", {})
                     if not isinstance(msg, dict):
