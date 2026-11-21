@@ -68,7 +68,7 @@ List sessions, summarize a single session, or replay full conversations with col
 
 ```
 $ claude-session            # sessions updated in the last 3 days
-$ claude-session -v         # same, with token usage columns and totals
+$ claude-session -v         # same, plus Remote Control session IDs and token usage
 ```
 
 Lists sessions with list number, session UUID, created/updated times, project, and title (the session's custom title, else its AI-generated title, else its first prompt). Worktree projects are shown as `repo:worktree`.
@@ -79,7 +79,7 @@ $ claude-session 3 --info
 
 Shows a summary of session #3 without replaying it:
 
-- **Identity** -- title, project, working directory, git branch, worktree (name, base branch and commit), remote-control URL, transcript path
+- **Identity** -- title, project, working directory, git branch, worktree (name, base branch and commit), Remote Control session ID and URL, transcript path
 - **Timeline** -- start, last activity, elapsed and active time, prompt/response counts, interruptions, compactions
 - **Environment** -- models used, effort level, permission mode, entrypoint, Claude Code version
 - **Activity** -- tool calls by tool, tool errors, skills invoked, subagents, web searches, pull requests, files modified
@@ -99,7 +99,7 @@ Replays session #3 with full conversation: user messages, assistant text, thinki
 |------|--------|
 | `-d N`, `--days N` | List sessions updated in the last N days (default 3; 0 = all) |
 | `--all` | List all sessions regardless of age |
-| `-v`, `--verbose` | Show token usage (list, replay, and `--info`) |
+| `-v`, `--verbose` | List: add Remote Control session ID and token columns. Replay/`--info`: show token usage |
 | `-i`, `--info` | Summarize the session instead of replaying it |
 | `--compact` | Hide thinking blocks, truncate tool results to 3 lines |
 | `--no-thinking` | Hide thinking/reasoning blocks only |
@@ -112,6 +112,7 @@ Replays session #3 with full conversation: user messages, assistant text, thinki
 |--------|---------|
 | `N` | Session number from the list (e.g. `3`) |
 | `<uuid>` | Full or partial session UUID (e.g. `a8359a07`) |
+| `session_<id>` | Full or partial Remote Control session ID (`cse_<id>` also accepted) |
 | `<path>` | Direct path to a `.jsonl` file (for subagents) |
 
 A bare number within the session list range is treated as a list index. Larger numbers or strings containing non-digit characters are treated as UUID prefixes. Ambiguous prefixes produce an error listing the matches.

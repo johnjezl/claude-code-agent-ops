@@ -108,6 +108,27 @@ def extract_user_text(content):
     return text
 
 
+def remote_session_id(entry):
+    """Return the remote-control session ID ('session_...') an entry records, or ''.
+
+    Remote Control sessions log a bridge-session entry with bridgeSessionId
+    'cse_<X>' and a bridge_status entry with URL .../code/session_<X>; both
+    name the same claude.ai session, which the UI and URLs call 'session_<X>'.
+    """
+    etype = entry.get("type")
+    if etype == "bridge-session":
+        bid = entry.get("bridgeSessionId") or ""
+        if bid.startswith("cse_"):
+            return "session_" + bid[len("cse_"):]
+        return bid
+    if etype == "system" and entry.get("subtype") == "bridge_status":
+        url = entry.get("url") or ""
+        tail = url.rstrip("/").rsplit("/", 1)[-1]
+        if tail.startswith("session_"):
+            return tail
+    return ""
+
+
 def scan_session(path):
     """Read a session file once and collect metadata and usage."""
     stat = os.stat(path)
@@ -120,6 +141,7 @@ def scan_session(path):
         "last_ts": None,
         "first_msg": "",
         "custom_title": "",
+        "remote_ids": [],
         "ai_title": "",
         "total_input": 0,
         "total_output": 0,
@@ -137,6 +159,9 @@ def scan_session(path):
             if not isinstance(data, dict):
                 continue
             etype = data.get("type")
+            rid = remote_session_id(data)
+            if rid and rid not in info["remote_ids"]:
+                info["remote_ids"].append(rid)
             if etype == "custom-title" and data.get("customTitle"):
                 info["custom_title"] = data["customTitle"]
             elif etype == "ai-title" and data.get("aiTitle"):
@@ -168,6 +193,7 @@ def scan_session(path):
                 info["total_cache_create"] += usage.get("cache_creation_input_tokens", 0) or 0
     info["first_ts"] = info["first_ts"] or stat.st_mtime
     info["last_ts"] = info["last_ts"] or stat.st_mtime
+    info["remote_id"] = info["remote_ids"][-1] if info["remote_ids"] else ""
     info["title"] = info["custom_title"] or info["ai_title"] or info["first_msg"].split("\n")[0]
     return info
 
@@ -212,7 +238,10 @@ def list_sessions(max_age_days=None, verbose=False):
     width = shutil.get_terminal_size((160, 24)).columns
     cols = f"  {'#':<4} {'Session ID':<36}  {'Created':<16}  {'Updated':<16}"
     rule = f"  {'-'*4} {'-'*36}  {'-'*16}  {'-'*16}"
+    rid_w = 32  # len("session_") + 24-char ID
     if verbose:
+        cols += f"  {'Remote Session':<{rid_w}}"
+        rule += f"  {'-'*rid_w}"
         cols += f"  {'Input':>10} {'Output':>10} {'Cache Read':>13} {'Cache Write':>12}"
         rule += f"  {'-'*10} {'-'*10} {'-'*13} {'-'*12}"
     cols += f"  {'Project':<28}  "
@@ -227,6 +256,7 @@ def list_sessions(max_age_days=None, verbose=False):
         updated = datetime.fromtimestamp(s["last_ts"]).strftime("%Y-%m-%d %H:%M")
         row = f"  {i:<4} {s['session_id']:<36}  {created:<16}  {updated:<16}"
         if verbose:
+            row += f"  {(s['remote_id'] or '-'):<{rid_w}}"
             vals = [s["total_input"], s["total_output"], s["total_cache_read"], s["total_cache_create"]]
             totals = [a + b for a, b in zip(totals, vals)]
             row += f"  {vals[0]:>10,} {vals[1]:>10,} {vals[2]:>13,} {vals[3]:>12,}"
@@ -240,11 +270,11 @@ def list_sessions(max_age_days=None, verbose=False):
         print(row)
 
     if verbose:
-        print(f"  {'-'*4} {'-'*36}  {'-'*16}  {'-'*16}  {'-'*10} {'-'*10} {'-'*13} {'-'*12}")
-        print(f"  {'':4} {'':36}  {'':16}  {'TOTAL':<16}"
+        print(f"  {'-'*4} {'-'*36}  {'-'*16}  {'-'*16}  {'-'*rid_w}  {'-'*10} {'-'*10} {'-'*13} {'-'*12}")
+        print(f"  {'':4} {'':36}  {'':16}  {'TOTAL':<16}  {'':<{rid_w}}"
               f"  {totals[0]:>10,} {totals[1]:>10,} {totals[2]:>13,} {totals[3]:>12,}")
 
-    print(f"\n  Replay: claude-session <# | uuid-prefix>    Details: claude-session <# | uuid-prefix> --info\n")
+    print(f"\n  Replay: claude-session <# | id-prefix>    Details: claude-session <# | id-prefix> --info\n")
 
 
 def format_duration(seconds):
@@ -418,7 +448,8 @@ def show_session_info(path, verbose=False):
     if wt:
         row("Worktree", f"{wt.get('worktreeName', '')} (from {wt.get('originalBranch', '?')} "
                         f"@ {str(wt.get('originalHeadCommit', ''))[:10]})")
-    row("Remote control", s["remote_url"])
+    row("Remote session", ", ".join(s["remote_ids"]))
+    row("Remote URL", s["remote_url"] or (f"https://claude.ai/code/{s['remote_id']}" if s["remote_id"] else ""))
     row("Session file", s["path"])
 
     section("Timeline")
@@ -518,11 +549,19 @@ def find_session_path(identifier, max_age_days=None):
     if force_index:
         return None
 
+    # Remote-control IDs: accept 'cse_<X>' as well as 'session_<X>'
+    if identifier.startswith("cse_"):
+        identifier = "session_" + identifier[len("cse_"):]
+
+    def id_matches(s):
+        return (s["session_id"].startswith(identifier)
+                or any(r.startswith(identifier) for r in s["remote_ids"]))
+
     # Search by session ID (prefix match) — filtered list first
-    matches = [s for s in sessions if s["session_id"].startswith(identifier)]
+    matches = [s for s in sessions if id_matches(s)]
     if not matches and max_age_days is not None:
-        # Widen the search to all sessions for UUID prefix lookup
-        matches = [s for s in find_sessions() if s["session_id"].startswith(identifier)]
+        # Widen the search to all sessions for ID prefix lookup
+        matches = [s for s in find_sessions() if id_matches(s)]
     if len(matches) == 1:
         return matches[0]["path"]
     elif len(matches) > 1:
@@ -768,6 +807,7 @@ def main():
 {BOLD}SESSION IDENTIFIER{RESET}
   N                   Session number from the list (e.g. 3)
   <uuid>              Full or partial session UUID
+  session_<id>        Full or partial Remote Control session ID (cse_<id> also works)
   <path>              Direct path to a .jsonl file (e.g. for subagents)
 
   A bare number within the session list range is treated as a list index.
@@ -778,8 +818,9 @@ def main():
 {BOLD}OPTIONS{RESET}
   -d N, --days N      Show sessions updated in the last N days (default: 3)
   --all               Show all sessions regardless of age
-  -v, --verbose       Show token usage (list columns, per-response counts in
-                      replay, token section in --info) and untruncated lists
+  -v, --verbose       Show Remote Control session IDs and token usage in the
+                      list, per-response token counts in replay, and token
+                      usage plus untruncated lists in --info
   -i, --info          Show session details instead of replaying it: title,
                       directory, branch, worktree, timeline, models, tool and
                       skill usage, files modified, PRs, subagents
