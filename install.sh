@@ -17,6 +17,7 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX=/usr/local
 MODE=install
 LINK=0
+USER_INSTALL=0
 
 usage() {
     sed -n '2,10s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
@@ -26,7 +27,7 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --user)      PREFIX="$HOME/.local" ;;
+        --user)      PREFIX="$HOME/.local"; USER_INSTALL=1 ;;
         --prefix)    [ $# -ge 2 ] || die "--prefix needs a directory"; PREFIX="$2"; shift ;;
         --prefix=*)  PREFIX="${1#--prefix=}" ;;
         --link)      LINK=1 ;;
@@ -41,6 +42,11 @@ done
 # Make the prefix absolute and normalized (no trailing slash, no "..") so the
 # manifest records full paths and uninstall works from any directory.
 # -s keeps symlinked components as given; -m allows a not-yet-created path.
+[ -n "$PREFIX" ] || die "--prefix needs a non-empty directory"
+if [ "$USER_INSTALL" = 1 ] && [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    # sudo sets HOME to /root, so --user would install into root's ~/.local.
+    die "--user installs for the current user; run it without sudo"
+fi
 PREFIX="$(realpath -m -s -- "$PREFIX")"
 BIN_DIR="$PREFIX/bin"
 SHARE_DIR="$PREFIX/share/$NAME"
@@ -85,12 +91,23 @@ fi
 
 if [ "$MODE" = uninstall ]; then
     [ -f "$MANIFEST" ] || die "no install found under $PREFIX (missing $MANIFEST)"
+    if [ ! -w "$BIN_DIR" ] || [ ! -w "$SHARE_DIR" ]; then
+        die "cannot write to $PREFIX; re-run with sudo (or pass the --user/--prefix you installed with)"
+    fi
+    failed=0
     while IFS= read -r f; do
         # Only remove files inside this prefix's bin directory.
         case "$f" in
-            "$BIN_DIR"/*) rm -f -- "$f" && echo "removed $f" ;;
+            "$BIN_DIR"/*)
+                if rm -f -- "$f"; then
+                    echo "removed $f"
+                else
+                    failed=1
+                fi ;;
         esac
     done < "$MANIFEST"
+    # Keep the manifest if anything is left, so uninstall can be retried.
+    [ "$failed" = 0 ] || die "some files could not be removed; the install record was kept"
     rm -f -- "$MANIFEST"
     rmdir -- "$SHARE_DIR" 2>/dev/null || true
     echo "Uninstalled $NAME from $PREFIX."
@@ -113,6 +130,7 @@ previous=()
 [ -f "$MANIFEST" ] && mapfile -t previous < "$MANIFEST"
 
 installed=()
+declare -A is_installed=()
 for tool in "${TOOLS[@]}"; do
     src="$SRC_DIR/$tool"
     dest="$BIN_DIR/$tool"
@@ -126,10 +144,12 @@ for tool in "${TOOLS[@]}"; do
         echo "installed $dest"
     fi
     installed+=("$dest")
+    is_installed["$dest"]=1
 done
 
 for old in "${previous[@]}"; do
-    case " ${installed[*]} " in *" $old "*) continue ;; esac
+    [ -n "$old" ] || continue
+    [ -z "${is_installed[$old]:-}" ] || continue
     case "$old" in
         "$BIN_DIR"/*) rm -f -- "$old" && echo "removed   $old (no longer part of $NAME)" ;;
     esac

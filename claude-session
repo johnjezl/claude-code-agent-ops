@@ -13,6 +13,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import glob
 import shutil
@@ -96,7 +97,9 @@ def project_display_name(path):
         project = parts[-4] if len(parts) >= 4 and parts[-2] == "subagents" else parts[-2]
     else:
         project = rel.split(os.sep)[0]
-    home_prefix = os.path.expanduser("~").replace("/", "-")
+    # Claude Code names project dirs by replacing every non-alphanumeric
+    # character of the path with '-' (so /home/j.doe -> -home-j-doe).
+    home_prefix = re.sub(r"[^A-Za-z0-9]", "-", os.path.expanduser("~"))
     for prefix, repl in ((home_prefix + "-projects-", ""), (home_prefix + "-", "~/")):
         if project.startswith(prefix):
             project = repl + project[len(prefix):]
@@ -951,7 +954,7 @@ def main():
         return
 
     # Check for subagents
-    session_dir = path.replace(".jsonl", "")
+    session_dir = path[:-len(".jsonl")]
     subagent_dir = os.path.join(session_dir, "subagents")
     if os.path.isdir(subagent_dir):
         subagents = glob.glob(os.path.join(glob.escape(subagent_dir), "*.jsonl"))
