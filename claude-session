@@ -13,6 +13,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import glob
 import shutil
@@ -23,7 +24,9 @@ from collections import Counter, defaultdict
 from datetime import datetime
 
 
-PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+# Claude Code's data directory; honors CLAUDE_CONFIG_DIR like Claude Code does.
+CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
 
 
 def parse_timestamp(ts):
@@ -58,23 +61,45 @@ def format_time(ts):
         return ""
 
 
-# Terminal colors
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-USER_COLOR = "\033[1;34m"      # Bold blue
-ASSISTANT_COLOR = "\033[1;32m"  # Bold green
-THINKING_COLOR = "\033[2;35m"   # Dim magenta
-TOOL_COLOR = "\033[0;33m"       # Yellow
-TOOL_RESULT_COLOR = "\033[2;33m"  # Dim yellow
-ERROR_COLOR = "\033[0;31m"      # Red
-SEPARATOR_COLOR = "\033[2;37m"  # Dim gray
+# Terminal colors. Enabled only when stdout is a terminal and NO_COLOR is
+# unset (https://no-color.org); --color / --no-color override.
+COLORS = {
+    "RESET": "\033[0m",
+    "BOLD": "\033[1m",
+    "DIM": "\033[2m",
+    "USER_COLOR": "\033[1;34m",         # Bold blue
+    "ASSISTANT_COLOR": "\033[1;32m",    # Bold green
+    "THINKING_COLOR": "\033[2;35m",     # Dim magenta
+    "TOOL_COLOR": "\033[0;33m",         # Yellow
+    "TOOL_RESULT_COLOR": "\033[2;33m",  # Dim yellow
+    "ERROR_COLOR": "\033[0;31m",        # Red
+    "SEPARATOR_COLOR": "\033[2;37m",    # Dim gray
+}
+
+
+def set_color(enabled):
+    """Define the color globals as escape codes, or as empty strings."""
+    for name, code in COLORS.items():
+        globals()[name] = code if enabled else ""
+
+
+set_color(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
 
 
 def project_display_name(path):
     """Derive a short project name from a session file path."""
-    project = path.split("/projects/")[1].split("/")[0]
-    home_prefix = os.path.expanduser("~").replace("/", "-")
+    rel = os.path.relpath(os.path.abspath(path), PROJECTS_DIR)
+    if rel.split(os.sep)[0] == os.pardir:
+        # Outside the Claude data dir (e.g. a copied transcript): the encoded
+        # project name is the directory holding the file (for subagents,
+        # <project>/<session>/subagents/x.jsonl, it is three levels up).
+        parts = os.path.abspath(path).split(os.sep)
+        project = parts[-4] if len(parts) >= 4 and parts[-2] == "subagents" else parts[-2]
+    else:
+        project = rel.split(os.sep)[0]
+    # Claude Code names project dirs by replacing every non-alphanumeric
+    # character of the path with '-' (so /home/j.doe -> -home-j-doe).
+    home_prefix = re.sub(r"[^A-Za-z0-9]", "-", os.path.expanduser("~"))
     for prefix, repl in ((home_prefix + "-projects-", ""), (home_prefix + "-", "~/")):
         if project.startswith(prefix):
             project = repl + project[len(prefix):]
@@ -208,7 +233,7 @@ def find_sessions(max_age_days=None):
         cutoff = time.time() - max_age_days * 86400
 
     sessions = []
-    for path in glob.glob(f"{PROJECTS_DIR}/**/*.jsonl", recursive=True):
+    for path in glob.glob(os.path.join(glob.escape(PROJECTS_DIR), "**", "*.jsonl"), recursive=True):
         if "/subagents/" in path:
             continue
         if cutoff is not None and os.stat(path).st_mtime < cutoff:
@@ -407,7 +432,7 @@ def collect_session_info(path):
                             add_unique(files_modified, inp.get("file_path") or inp.get("notebook_path"))
 
     subagent_dir = os.path.join(path[:-len(".jsonl")], "subagents")
-    subagent_files = sorted(glob.glob(f"{subagent_dir}/*.jsonl")) if os.path.isdir(subagent_dir) else []
+    subagent_files = sorted(glob.glob(os.path.join(glob.escape(subagent_dir), "*.jsonl"))) if os.path.isdir(subagent_dir) else []
 
     info.update(
         cwds=cwds, branches=branches, versions=versions, entrypoints=entrypoints,
@@ -788,6 +813,14 @@ def main():
     # Exit quietly when piped into head/less and the reader closes early
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     args = sys.argv[1:]
+    color = None  # the last --color/--no-color wins
+    for a in args:
+        if a == "--color":
+            color = True
+        elif a == "--no-color":
+            color = False
+    if color is not None:
+        set_color(color)
 
     show_thinking = True
     show_tools = True
@@ -827,7 +860,13 @@ def main():
   --no-thinking       Hide thinking/reasoning blocks
   --no-tools          Hide tool calls and tool results
   --compact           Hide thinking + truncate tool results to 3 lines
+  --color, --no-color Force colors on/off (default: on only for a terminal,
+                      off if NO_COLOR is set). Use --color with less -R.
   -h, --help          Show this help message
+
+{BOLD}ENVIRONMENT{RESET}
+  CLAUDE_CONFIG_DIR   Claude Code data directory (default: ~/.claude)
+  NO_COLOR            Disable colors when set
 
 {BOLD}EXAMPLES{RESET}
   claude-session                          List sessions from the last 3 days
@@ -847,7 +886,9 @@ def main():
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("-v", "--verbose"):
+        if a in ("--color", "--no-color"):
+            pass  # handled above
+        elif a in ("-v", "--verbose"):
             verbose = True
         elif a in ("-i", "--info"):
             info_mode = True
@@ -913,10 +954,10 @@ def main():
         return
 
     # Check for subagents
-    session_dir = path.replace(".jsonl", "")
+    session_dir = path[:-len(".jsonl")]
     subagent_dir = os.path.join(session_dir, "subagents")
     if os.path.isdir(subagent_dir):
-        subagents = glob.glob(f"{subagent_dir}/*.jsonl")
+        subagents = glob.glob(os.path.join(glob.escape(subagent_dir), "*.jsonl"))
         if subagents:
             print(f"{DIM}Note: This session has {len(subagents)} subagent conversation(s).{RESET}")
             print(f"{DIM}View them with: claude-session <path-to-subagent.jsonl>{RESET}\n")
